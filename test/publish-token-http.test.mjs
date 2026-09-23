@@ -27,6 +27,7 @@ test('publish token endpoint validates input and never echoes the secret', { tim
   };
   let child;
   try {
+    await mkdir(path.join(root, 'content'), { recursive: true });
     await put('hugo.toml', 'baseURL = "http://localhost/"\ntheme = "fixture"\n');
     await put('themes/fixture/theme-config.schema.json', '{"sections":[]}');
     const adminPort = await unusedPort();
