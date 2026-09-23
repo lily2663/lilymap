@@ -9,11 +9,28 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
+      - name: Check out compatible theme
+        uses: actions/checkout@v6
+        with:
+          repository: lily2663/lily-epitaph
+          # Keep this aligned with the theme compatibility contract.
+          ref: 6630ae79842e8c1390e058bfb65d04a3ae4419d1
+          path: .test/lily-epitaph
+          persist-credentials: false
       - uses: actions/setup-node@v4
         with:
           node-version: 22
           cache: npm
       - run: npm ci
-      - run: npm test
+      - name: Install Hugo
+        uses: peaceiris/actions-hugo@v3
+        with:
+          hugo-version: 0.165.0
+          extended: false
+      - name: Run tests including theme integration
+        run: npm test
+        env:
+          LILY_TEST_THEME_PATH: ${{ github.workspace }}/.test/lily-epitaph
+          LILY_TEST_HUGO_PATH: hugo
       - run: npm run check
       - run: npm run build
