@@ -56,3 +56,9 @@ test('layout modules enforce slot and schema contracts', () => {
   assert.doesNotThrow(() => validateLayoutAgainstRegistry(layout, { welcome: manifest }));
   assert.throws(() => validateLayoutAgainstRegistry({ ...layout, slots: { main: [{ ...layout.slots.main[0], config: { enabled: 'yes' } }] } }, { welcome: manifest }), /必须是布尔值/);
 });
+
+test('module protocol defaults legacy manifests to v1 and rejects unknown major versions', () => {
+  const legacy = normalizeModuleManifest('quote', 'id: quote\nallowedSlots:\n  - home.main\n', 'site');
+  assert.equal(legacy.apiVersion, 'lily-module/v1');
+  assert.throws(() => normalizeModuleManifest('quote', 'apiVersion: lily-module/v2\nid: quote\nallowedSlots:\n  - home.main\n', 'site'), /不支持的 apiVersion/);
+});

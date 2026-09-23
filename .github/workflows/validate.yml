@@ -3,18 +3,31 @@ name: Validate LilyMap
 on:
   push:
   pull_request:
+  workflow_call:
+    inputs:
+      theme_ref:
+        type: string
+        required: false
 
 jobs:
   validate:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
+      - name: Read compatible theme pin
+        id: theme-pin
+        shell: bash
+        run: |
+          ref='${{ inputs.theme_ref }}'
+          if [ -z "$ref" ]; then
+            ref=$(node -p "require('./.github/theme-compatibility.json').ref")
+          fi
+          echo "ref=$ref" >> "$GITHUB_OUTPUT"
       - name: Check out compatible theme
         uses: actions/checkout@v6
         with:
           repository: lily2663/lily-epitaph
-          # Keep this aligned with the theme compatibility contract.
-          ref: 6630ae79842e8c1390e058bfb65d04a3ae4419d1
+          ref: ${{ steps.theme-pin.outputs.ref }}
           path: .test/lily-epitaph
           persist-credentials: false
       - uses: actions/setup-node@v4
@@ -33,4 +46,8 @@ jobs:
           LILY_TEST_THEME_PATH: ${{ github.workspace }}/.test/lily-epitaph
           LILY_TEST_HUGO_PATH: hugo
       - run: npm run check
+      - name: Validate pinned theme protocol manifests
+        run: npm run protocol:check
+        env:
+          LILY_TEST_THEME_PATH: ${{ github.workspace }}/.test/lily-epitaph
       - run: npm run build

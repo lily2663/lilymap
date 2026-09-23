@@ -16,6 +16,7 @@ import { normalizeLayout, normalizeModuleManifest, parseLayout, serializeLayout,
 import { validateFriends, validateProfile } from './src/domain/profile.mjs';
 import { createHttpPrimitives } from './src/http/primitives.mjs';
 import { updateModulePlacement } from './src/domain/module-config.mjs';
+import { redactGitCredentials, validatePublishToken } from './src/domain/publish-security.mjs';
 
 // esbuild 打包成 cjs 后 __dirname 可用；dev 模式（node 直接跑 ESM）下 __dirname 不存在，
 // 用 import.meta.url 兜底推导。
@@ -902,9 +903,7 @@ async function gitNetwork(args) {
 }
 
 function safeGitFailure(result, token = '') {
-  let detail = String(result.stderr || result.stdout || '未知 Git 错误').trim();
-  if (token) detail = detail.split(token).join('[REDACTED]');
-  detail = detail.replace(/https:\/\/[^\s@]+@github\.com/gi, 'https://[REDACTED]@github.com');
+  const detail = redactGitCredentials(result.stderr || result.stdout, token);
   if (isTransientGitNetworkFailure(result)) {
     const route = result.proxyDetected ? '已读取 Windows 系统代理并重试一次' : '未检测到可用系统代理，已用 HTTP/1.1 重试一次';
     return `无法连接 GitHub 主站（${route}）。请确认代理正在运行后再点发布。`;
@@ -1899,8 +1898,8 @@ async function handleApi(req, res, url) {
   if (req.method === 'PUT' && pathname === '/api/publish/token') {
     if (publishState?.status === 'running') return fail(res, 409, '发布进行中，暂不能修改认证令牌。');
     const request = JSON.parse((await readBody(req, 4096)).toString('utf8'));
-    const token = String(request.token || '').trim();
-    if (token.length < 20 || token.length > 2048 || !/^[A-Za-z0-9_]+$/.test(token)) return fail(res, 400, '令牌格式无效：应为只含字母、数字或下划线的 20–2048 个字符。');
+    const token = validatePublishToken(request.token);
+    if (!token) return fail(res, 400, '令牌格式无效：应为只含字母、数字或下划线的 20–2048 个字符。');
     const tokenFile = path.join(repoRoot, '.token');
     await atomicWrite(tokenFile, `${token}\n`, { schedule: false });
     await fs.chmod(tokenFile, 0o600).catch(() => {});

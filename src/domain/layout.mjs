@@ -32,6 +32,8 @@ export function normalizeModuleManifest(fileId, raw, source) {
   const id = String(manifest.id || fileId).trim();
   if (!/^[a-z][a-z0-9-]*$/.test(id)) throw new Error(`模块 ${fileId} 的 id 不合法。`);
   if (id !== fileId) throw new Error(`模块文件 ${fileId}.yaml 与 manifest id ${id} 不一致。`);
+  const apiVersion = String(manifest.apiVersion || 'lily-module/v1');
+  if (apiVersion !== 'lily-module/v1') throw new Error(`模块 ${id} 使用不支持的 apiVersion: ${apiVersion}`);
   if (!Array.isArray(manifest.allowedSlots) || !manifest.allowedSlots.every((slot) => typeof slot === 'string' && /^[a-z][\w-]*\.[A-Za-z_][\w-]*$/.test(slot))) throw new Error(`模块 ${id} 缺少合法的 allowedSlots。`);
   const partial = manifest.template?.partial || `lily/modules/${id}/render.html`;
   if (typeof partial !== 'string' || partial.startsWith('/') || partial.includes('..')) throw new Error(`模块 ${id} 的模板路径不安全。`);
@@ -39,7 +41,7 @@ export function normalizeModuleManifest(fileId, raw, source) {
   for (const key of ['styles', 'scripts']) {
     if (assets[key] != null && (!Array.isArray(assets[key]) || !assets[key].every((resource) => typeof resource === 'string' && !resource.startsWith('/') && !resource.includes('..')))) throw new Error(`模块 ${id} 的 assets.${key} 无效。`);
   }
-  return { ...manifest, id, apiVersion: manifest.apiVersion || 'lily-module/v1', name: manifest.name || id, description: manifest.description || '', category: manifest.category || 'general', version: String(manifest.version || '0.1.0'), context: manifest.context || 'any', defaults: isObject(manifest.defaults) ? manifest.defaults : {}, schema: isObject(manifest.schema) ? manifest.schema : {}, template: { ...(isObject(manifest.template) ? manifest.template : {}), partial }, assets, capabilities: isObject(manifest.capabilities) ? manifest.capabilities : {}, source };
+  return { ...manifest, id, apiVersion, name: manifest.name || id, description: manifest.description || '', category: manifest.category || 'general', version: String(manifest.version || '0.1.0'), context: manifest.context || 'any', defaults: isObject(manifest.defaults) ? manifest.defaults : {}, schema: isObject(manifest.schema) ? manifest.schema : {}, template: { ...(isObject(manifest.template) ? manifest.template : {}), partial }, assets, capabilities: isObject(manifest.capabilities) ? manifest.capabilities : {}, source };
 }
 
 function validateModuleValue(value, definition, label) {

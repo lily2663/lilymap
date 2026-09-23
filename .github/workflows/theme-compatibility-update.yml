@@ -1,0 +1,62 @@
+name: Propose theme compatibility update
+
+on:
+  schedule:
+    - cron: '17 9 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  discover:
+    runs-on: ubuntu-latest
+    outputs:
+      ref: ${{ steps.upstream.outputs.ref }}
+      changed: ${{ steps.upstream.outputs.changed }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Read latest theme commit
+        id: upstream
+        shell: bash
+        run: |
+          branch=$(node -p "require('./.github/theme-compatibility.json').branch")
+          ref=$(git ls-remote https://github.com/lily2663/lily-epitaph.git "refs/heads/$branch" | cut -f1)
+          current=$(node -p "require('./.github/theme-compatibility.json').ref")
+          echo "ref=$ref" >> "$GITHUB_OUTPUT"
+          if [ "$ref" != "$current" ]; then echo "changed=true" >> "$GITHUB_OUTPUT"; else echo "changed=false" >> "$GITHUB_OUTPUT"; fi
+
+  validate-upstream:
+    needs: discover
+    if: needs.discover.outputs.changed == 'true'
+    uses: ./.github/workflows/validate.yml
+    with:
+      theme_ref: ${{ needs.discover.outputs.ref }}
+
+  propose-update:
+    needs: [discover, validate-upstream]
+    if: needs.discover.outputs.changed == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Update proposed compatibility pin
+        run: node .github/scripts/update-theme-compatibility.mjs '${{ needs.discover.outputs.ref }}'
+      - name: Open compatibility update PR
+        uses: peter-evans/create-pull-request@v7
+        with:
+          branch: automation/theme-compatibility-update
+          delete-branch: true
+          commit-message: 'chore: propose latest lily-epitaph compatibility pin'
+          title: 'chore: review lily-epitaph compatibility update'
+          body: |
+            This PR proposes testing the latest `lily-epitaph` main commit against LilyMap.
+
+            The reusable validation workflow passed against the exact proposed theme commit. Review the compatibility changes before merging; the pin stays fixed until then.
+          add-paths: .github/theme-compatibility.json
