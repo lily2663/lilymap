@@ -1575,6 +1575,7 @@ async function handleApi(req, res, url) {
         await atomicCreate(payloadPath, `${JSON.stringify(payload)}\n`);
         createdPayload = true;
         await atomicWrite(secretsPath, `${JSON.stringify({ ...secrets, [id]: password }, null, 2)}\n`, { schedule: false });
+        await fs.chmod(secretsPath, 0o600).catch(() => {});
         wroteSecrets = true;
         await atomicWrite(target, stub);
       } catch (error) {
@@ -1591,23 +1592,42 @@ async function handleApi(req, res, url) {
     if (request.action === 'decrypt') {
       if (parsed.frontMatter.params?.protected !== true || !(await exists(payloadPath))) return fail(res, 409, '文章没有可用的加密内容。');
       const payload = JSON.parse(await fs.readFile(payloadPath, 'utf8'));
-      if (payload.pageId !== id) return fail(res, 400, '加密文章 ID 不匹配。');
-      const body = decryptProtectedBody(payload, password);
+      const body = decryptProtectedBody(payload, password, id);
       const unmarked = patchFrontMatter(raw, { protected: false });
       const originalSource = await exists(privatePath) ? await fs.readFile(privatePath, 'utf8') : null;
       const unchangedStub = payload.publicStubHash === createHash('sha256').update(raw).digest('hex');
       const restored = originalSource && unchangedStub
         ? originalSource
         : unmarked.replace(/^(---\n[\s\S]*?\n---\n)[\s\S]*$/, (_, header) => header + body);
-      await atomicWrite(target, restored);
       const archived = path.join(trashRoot, 'protected', `${randomUUID()}-${id}`);
+      const archivedPrivate = path.join(archived, `${id}.md`);
+      const archivedPayload = path.join(archived, `${encodeURIComponent(id)}.json`);
+      const originalSecrets = await exists(secretsPath) ? await fs.readFile(secretsPath, 'utf8') : null;
+      let movedPrivate = false;
+      let movedPayload = false;
+      let updatedSecrets = false;
       await fs.mkdir(archived, { recursive: true });
-      if (await exists(privatePath)) await fs.rename(privatePath, path.join(archived, `${id}.md`));
-      await fs.rename(payloadPath, path.join(archived, `${encodeURIComponent(id)}.json`));
-      if (await exists(secretsPath)) {
-        const secrets = JSON.parse(await fs.readFile(secretsPath, 'utf8'));
-        delete secrets[id];
-        await atomicWrite(secretsPath, `${JSON.stringify(secrets, null, 2)}\n`, { schedule: false });
+      try {
+        if (await exists(privatePath)) {
+          await fs.rename(privatePath, archivedPrivate);
+          movedPrivate = true;
+        }
+        await fs.rename(payloadPath, archivedPayload);
+        movedPayload = true;
+        if (originalSecrets != null) {
+          const secrets = JSON.parse(originalSecrets);
+          delete secrets[id];
+          await atomicWrite(secretsPath, `${JSON.stringify(secrets, null, 2)}\n`, { schedule: false });
+          await fs.chmod(secretsPath, 0o600).catch(() => {});
+          updatedSecrets = true;
+        }
+        await atomicWrite(target, restored);
+      } catch (error) {
+        await atomicWrite(target, raw).catch(() => {});
+        if (movedPayload) await fs.rename(archivedPayload, payloadPath).catch(() => {});
+        if (movedPrivate) await fs.rename(archivedPrivate, privatePath).catch(() => {});
+        if (updatedSecrets && originalSecrets != null) await atomicWrite(secretsPath, originalSecrets, { schedule: false }).catch(() => {});
+        throw error;
       }
       return send(res, 200, { ok: true, note: '正文已恢复为公开内容，加密文件已移入回收区。' });
     }
