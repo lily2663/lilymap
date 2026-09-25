@@ -159,9 +159,10 @@ export function createLayoutModuleService({
   }
 
   async function moveModuleToTrash(id, manifest) {
-    const sources = siteModulePaths(id, manifest).filter((source) => fsApi.access(source).then(() => true).catch(() => false));
     const existing = [];
-    for (const source of sources) if (await source) existing.push(source);
+    for (const source of siteModulePaths(id, manifest)) {
+      if (await exists(source)) existing.push(source);
+    }
     const destinationRoot = path.join(trashRoot, 'modules', `${stamp()}-${id}`);
     const moved = [];
     try {
