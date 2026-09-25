@@ -8,6 +8,11 @@ export function createHttpPrimitives({ port, maxBodyBytes, maxDecodedImageBytes 
     return error;
   }
 
+  function adminHostAllowed(request) {
+    const host = String(request.headers.host || '').trim().toLowerCase();
+    return host === `127.0.0.1:${port}` || host === `localhost:${port}`;
+  }
+
   function adminOriginAllowed(request) {
     const origin = request.headers.origin;
     const fetchSite = request.headers['sec-fetch-site'];
@@ -25,7 +30,7 @@ export function createHttpPrimitives({ port, maxBodyBytes, maxDecodedImageBytes 
       'cross-origin-resource-policy': 'same-origin',
       'permissions-policy': 'camera=(), microphone=(), geolocation=(), payment=()',
       'content-security-policy': extension === '.html'
-        ? "default-src 'self'; base-uri 'none'; object-src 'none'; frame-ancestors 'none'; img-src 'self' data: blob:; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; connect-src 'self'; form-action 'self'"
+        ? "default-src 'self'; base-uri 'none'; object-src 'none'; frame-ancestors 'none'; img-src 'self' data: blob:; style-src 'self' 'unsafe-inline'; script-src 'self'; connect-src 'self'; form-action 'self'"
         : "default-src 'none'; base-uri 'none'; frame-ancestors 'none'; sandbox",
     };
   }
@@ -82,11 +87,11 @@ export function createHttpPrimitives({ port, maxBodyBytes, maxDecodedImageBytes 
     let size = 0;
     for await (const chunk of request) {
       size += chunk.length;
-      if (size > limit) throw new Error('请求内容过大。');
+      if (size > limit) throw httpError(413, '请求内容过大。');
       chunks.push(chunk);
     }
     return Buffer.concat(chunks);
   }
 
-  return { adminOriginAllowed, fail, hasExpectedImageSignature, httpError, readBody, send, staticSecurityHeaders };
+  return { adminHostAllowed, adminOriginAllowed, fail, hasExpectedImageSignature, httpError, readBody, send, staticSecurityHeaders };
 }
