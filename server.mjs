@@ -8,22 +8,23 @@ import { fileURLToPath } from 'node:url';
 import { networkInterfaces } from 'node:os';
 import { resolveInside } from './src/fs/path-security.mjs';
 import { createAtomicFileService } from './src/fs/atomic-files.mjs';
+import { createFileTransactionService } from './src/fs/file-transaction.mjs';
 import { createLilyMapSourceArchive } from './src/services/source-archive.mjs';
 import { createBuildService } from './src/services/build-service.mjs';
 import { createImportPlanner } from './src/services/import-planner.mjs';
+import { createGitService } from './src/services/git-service.mjs';
+import { createPublishService } from './src/services/publish-service.mjs';
+import { createSiteSettingsService } from './src/services/site-settings-service.mjs';
 import { safeSlug } from './src/domain/slug.mjs';
 import YAML from 'yaml';
 import { formatYamlValue, parseFrontMatter, patchFrontMatter } from './src/domain/front-matter.mjs';
-import { parseToml, patchMenus, patchTomlValue } from './src/domain/toml.mjs';
+import { parseToml } from './src/domain/toml.mjs';
 import { decryptProtectedBody, encryptProtectedBody } from './src/domain/protected-content.mjs';
 import { isObject, parseYaml } from './src/domain/value.mjs';
 import { normalizeLayout, normalizeModuleManifest, parseLayout, serializeLayout, validateLayoutAgainstRegistry } from './src/domain/layout.mjs';
-import { validateFriends, validateProfile } from './src/domain/profile.mjs';
-import { validateMenus, validateThemeSettingsPatch } from './src/domain/theme-config.mjs';
 import { createHttpPrimitives } from './src/http/primitives.mjs';
 import { streamFile } from './src/http/static-files.mjs';
 import { updateModulePlacement } from './src/domain/module-config.mjs';
-import { isSensitivePublishPath, publishPushArguments, redactGitCredentials, validatePublishToken } from './src/domain/publish-security.mjs';
 
 // esbuild 打包成 cjs 后 __dirname 可用；dev 模式（node 直接跑 ESM）下 __dirname 不存在，
 // 用 import.meta.url 兜底推导。
@@ -281,22 +282,6 @@ async function walk(root, predicate = () => true) {
   return entries;
 }
 
-async function readFriends() {
-  const raw = await fs.readFile(siteDataFile, 'utf8');
-  const site = parseYaml(raw, '站点数据');
-  if (site.friends != null && !Array.isArray(site.friends)) throw new Error('站点数据中的 friends 必须是列表。');
-  return { friends: site.friends || [], version: createHash('sha256').update(raw).digest('hex') };
-}
-
-async function readProfile() {
-  const raw = await fs.readFile(siteDataFile, 'utf8');
-  const site = parseYaml(raw, '站点数据');
-  return {
-    profile: { author: site.author || '', aboutTitle: site.aboutTitle || '', about: site.about || [], links: site.links || [] },
-    version: createHash('sha256').update(raw).digest('hex'),
-  };
-}
-
 function layoutRevisionRoot(name) { return path.join(trashRoot, 'layouts', name); }
 
 async function snapshotLayout(name, target) {
@@ -387,10 +372,13 @@ async function installSiteModule(request) {
   for (const file of manifest.assets.scripts || []) if (file !== scriptPath) throw new Error(`JS 必须命名为 ${scriptPath}。`);
   if ((manifest.assets.styles || []).includes(stylePath) && typeof request.style !== 'string') throw new Error('manifest 声明了 CSS，但未提供样式内容。');
   if ((manifest.assets.scripts || []).includes(scriptPath) && typeof request.script !== 'string') throw new Error('manifest 声明了 JS，但未提供脚本内容。');
-  await atomicWrite(path.join(userModulesRoot, `${id}.yaml`), rawManifest);
-  await atomicWrite(path.join(repoRoot, 'layouts', 'partials', manifest.template.partial), request.template);
-  if ((manifest.assets.styles || []).includes(stylePath)) await atomicWrite(path.join(repoRoot, 'assets', stylePath), request.style);
-  if ((manifest.assets.scripts || []).includes(scriptPath)) await atomicWrite(path.join(repoRoot, 'assets', scriptPath), request.script);
+  const files = [
+    { target: path.join(userModulesRoot, `${id}.yaml`), content: rawManifest },
+    { target: path.join(repoRoot, 'layouts', 'partials', manifest.template.partial), content: request.template },
+  ];
+  if ((manifest.assets.styles || []).includes(stylePath)) files.push({ target: path.join(repoRoot, 'assets', stylePath), content: request.style });
+  if ((manifest.assets.scripts || []).includes(scriptPath)) files.push({ target: path.join(repoRoot, 'assets', scriptPath), content: request.script });
+  await fileTransaction.replaceFiles(files);
   return { id, manifest };
 }
 
@@ -650,36 +638,7 @@ async function uninstallSiteModule(id) {
 
 function versionFor(raw, stat) { return `${stat.size}:${createHash('sha256').update(raw).digest('hex').slice(0, 16)}`; }
 
-function gitEnvironment(config = []) {
-  const env = { ...process.env, GIT_TERMINAL_PROMPT: '0' };
-  for (const key of Object.keys(env)) {
-    if (key === 'GIT_CONFIG_COUNT' || /^GIT_CONFIG_(?:KEY|VALUE)_\d+$/.test(key)) delete env[key];
-  }
-  if (config.length) {
-    env.GIT_CONFIG_COUNT = String(config.length);
-    config.forEach(([key, value], index) => {
-      env[`GIT_CONFIG_KEY_${index}`] = String(key);
-      env[`GIT_CONFIG_VALUE_${index}`] = String(value);
-    });
-  }
-  return env;
-}
-
-async function git(args, config = []) {
-  return new Promise((resolve) => {
-    const child = spawn('git', args, {
-      cwd: repoRoot,
-      windowsHide: true,
-      shell: false,
-      env: gitEnvironment(config),
-    });
-    let stdout = ''; let stderr = '';
-    child.stdout.on('data', (data) => { stdout += data; });
-    child.stderr.on('data', (data) => { stderr += data; });
-    child.on('close', (code) => resolve({ code, stdout, stderr }));
-    child.on('error', (error) => resolve({ code: 1, stdout, stderr: error.message }));
-  });
-}
+const { git, gitNetwork, systemGitProxy, safeGitFailure, gitChanges } = createGitService({ repoRoot });
 
 function runLocalCommand(command, args) {
   return new Promise((resolve) => {
@@ -821,182 +780,6 @@ async function importWallpaperMedia(sourcePath, targetName) {
   };
 }
 
-let systemProxyCache;
-async function systemGitProxy() {
-  if (systemProxyCache !== undefined) return systemProxyCache;
-  const environmentProxy = process.env.HTTPS_PROXY || process.env.https_proxy || process.env.HTTP_PROXY || process.env.http_proxy;
-  if (environmentProxy) {
-    try {
-      const parsed = new URL(environmentProxy);
-      if (/^https?:$/.test(parsed.protocol) && parsed.hostname) return (systemProxyCache = parsed.href);
-    } catch {}
-  }
-  if (process.platform !== 'win32') return (systemProxyCache = '');
-  const registryKey = 'HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings';
-  const [enabled, configured] = await Promise.all([
-    runLocalCommand('reg.exe', ['query', registryKey, '/v', 'ProxyEnable']),
-    runLocalCommand('reg.exe', ['query', registryKey, '/v', 'ProxyServer']),
-  ]);
-  if (enabled.code !== 0 || configured.code !== 0 || !/ProxyEnable\s+REG_DWORD\s+0x1\b/i.test(enabled.stdout)) return (systemProxyCache = '');
-  const raw = configured.stdout.match(/ProxyServer\s+REG_SZ\s+(.+)$/im)?.[1]?.trim() || '';
-  const entries = raw.split(';').map((entry) => entry.trim()).filter(Boolean);
-  const selected = entries.find((entry) => /^https=/i.test(entry)) || entries.find((entry) => /^http=/i.test(entry)) || entries[0] || '';
-  const address = selected.replace(/^[a-z]+=/i, '');
-  if (!address || /[\r\n]/.test(address)) return (systemProxyCache = '');
-  const normalized = /^[a-z]+:\/\//i.test(address) ? address : `http://${address}`;
-  try {
-    const parsed = new URL(normalized);
-    if (!/^https?:$/.test(parsed.protocol) || !parsed.hostname) return (systemProxyCache = '');
-    return (systemProxyCache = parsed.href);
-  } catch { return (systemProxyCache = ''); }
-}
-
-function isTransientGitNetworkFailure(result) {
-  return /failed to connect|could not resolve|connection (?:was )?reset|timed? out|tls connect|http\/2 stream|schannel/i.test(`${result.stderr}\n${result.stdout}`);
-}
-
-async function gitNetwork(args, config = []) {
-  const proxy = await systemGitProxy();
-  const transport = proxy ? [['http.proxy', proxy]] : [];
-  let result = await git(args, [...transport, ...config]);
-  if (result.code !== 0 && isTransientGitNetworkFailure(result)) {
-    result = await git(args, [['http.version', 'HTTP/1.1'], ...transport, ...config]);
-    result.retried = true;
-  }
-  result.proxyDetected = Boolean(proxy);
-  return result;
-}
-
-function safeGitFailure(result, token = '') {
-  const detail = redactGitCredentials(result.stderr || result.stdout, token);
-  if (isTransientGitNetworkFailure(result)) {
-    const route = result.proxyDetected ? '已读取 Windows 系统代理并重试一次' : '未检测到可用系统代理，已用 HTTP/1.1 重试一次';
-    return `无法连接 GitHub 主站（${route}）。请确认代理正在运行后再点发布。`;
-  }
-  if (/authentication failed|invalid username or password|403|401/i.test(detail)) return 'GitHub 认证失败，请更新博客根目录的 .token。';
-  return detail.slice(0, 800);
-}
-
-async function gitChanges() {
-  const result = await git(['-c', 'core.quotepath=false', 'status', '--short']);
-  return result.stdout.split(/\r?\n/).filter(Boolean).map((line) => ({ status: line.slice(0, 2).trim() || '??', path: line.slice(3).trim().replaceAll('\\', '/') }));
-}
-
-const localConfigFile = path.join(repoRoot, '.lilymap-local.json');
-function validBlogRemote(value) {
-  return typeof value === 'string' && /^https:\/\/github\.com\/[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+(?:\.git)?$/.test(value);
-}
-function validPublishBranch(value) {
-  return typeof value === 'string' && /^[A-Za-z0-9][A-Za-z0-9._/-]{0,99}$/.test(value)
-    && !value.includes('..') && !value.includes('//') && !value.endsWith('/') && !value.endsWith('.lock');
-}
-async function readPublishConfig() {
-  if (!(await exists(localConfigFile))) return {};
-  return JSON.parse(await fs.readFile(localConfigFile, 'utf8'));
-}
-async function publishRemote() {
-  const config = await readPublishConfig();
-  if (validBlogRemote(config.publishRemote)) return config.publishRemote;
-  const current = await git(['remote', 'get-url', 'github']);
-  return current.code === 0 && validBlogRemote(current.stdout.trim()) ? current.stdout.trim() : '';
-}
-async function publishBranch() {
-  const config = await readPublishConfig();
-  return validPublishBranch(config.publishBranch) ? config.publishBranch : 'main';
-}
-
-async function findTokenFile() {
-  const candidates = [path.join(repoRoot, '.token')];
-  for (const candidate of candidates) if (await exists(candidate)) return candidate;
-  return null;
-}
-
-async function ensureBlogRemote(expected) {
-  if (!validBlogRemote(expected)) throw new Error('尚未设置有效的 GitHub 发布目标。');
-  const current = await git(['remote', 'get-url', 'github']);
-  if (current.code === 0) {
-    const url = current.stdout.trim();
-    if (url.toLowerCase().replace(/\.git$/, '') !== expected.toLowerCase().replace(/\.git$/, '')) throw new Error(`github 远程与 LilyMap 发布目标不一致：${url}`);
-    return;
-  }
-  const add = await git(['remote', 'add', 'github', expected]);
-  if (add.code !== 0) throw new Error(`无法添加 github 远程：${add.stderr.trim()}`);
-}
-
-async function publishToBlog(commitMessage, force, report = () => {}) {
-  report(5, '正在检查 GitHub 凭据');
-  const tokenFile = await findTokenFile();
-  if (!tokenFile) throw new Error('未找到 GitHub 认证 token（.token）。');
-  const token = (await fs.readFile(tokenFile, 'utf8')).trim();
-  if (!token) throw new Error('token 为空。');
-  report(12, '正在确认目标仓库');
-  await ensureBlogRemote(await publishRemote());
-  const targetBranch = await publishBranch();
-  report(20, '正在整理本地变更');
-  const trackedLocal = await git(['ls-files', '--', '.token', '.lilymap-local.json', 'lilymap.json', 'hugo-desk.json', '.secrets', 'private-content', '.admin-trash', '.backups']);
-  if (trackedLocal.code !== 0) throw new Error(`无法检查本机敏感文件：${trackedLocal.stderr.trim()}`);
-  const trackedSensitive = trackedLocal.stdout.split(/\r?\n/).filter(Boolean).filter(isSensitivePublishPath);
-  if (trackedSensitive.length) throw new Error(`检测到不应进入 Git 的本机文件：${trackedSensitive.slice(0, 5).join(', ')}。请先从 Git 索引移除后再发布。`);
-  const add = await git(['add', '-A', '--', '.',
-    ':(exclude).token', ':(exclude).lilymap-local.json', ':(exclude)lilymap.json', ':(exclude)hugo-desk.json',
-    ':(exclude).secrets/**', ':(exclude)private-content/**', ':(exclude).admin-trash/**', ':(exclude).backups/**',
-  ]);
-  if (add.code !== 0) throw new Error(`git add 失败：${add.stderr.trim()}`);
-  const stagedNames = await git(['diff', '--cached', '--name-only', '--']);
-  if (stagedNames.code !== 0) throw new Error(`无法检查暂存区：${stagedNames.stderr.trim()}`);
-  const stagedSensitive = stagedNames.stdout.split(/\r?\n/).filter(Boolean).filter(isSensitivePublishPath);
-  if (stagedSensitive.length) throw new Error(`暂存区包含本机敏感文件，已拒绝发布：${stagedSensitive.slice(0, 5).join(', ')}。`);
-  const staged = await git(['diff', '--cached', '--quiet']);
-  report(30, staged.code !== 0 ? '正在创建本次提交' : '没有新文件需要提交');
-  if (staged.code !== 0) {
-    // 默认英文 conventional commit；用户可在发布界面自定义（UTF-8 临时文件 -F 提交，避免 Windows 编码丢失）
-    const message = String(commitMessage || '').slice(0, 200).trim() || 'chore: publish blog updates';
-    const msgFile = path.join(trashRoot, `commit-msg-${Date.now()}.txt`);
-    await fs.mkdir(trashRoot, { recursive: true });
-    await fs.writeFile(msgFile, message, 'utf8');
-    // 不覆盖 user.name/user.email，使用仓库/全局配置的真实身份提交
-    const commit = await git(['-c', 'i18n.commitencoding=utf-8', 'commit', '-F', msgFile]);
-    await fs.rm(msgFile, { force: true }).catch(() => {});
-    if (commit.code !== 0) throw new Error(`git commit 失败：${commit.stderr.trim()}`);
-  }
-  const authConfig = [[`url.https://oauth2:${token}@github.com/.insteadOf`, 'https://github.com/']];
-  // Keep credentials and proxy values out of the process command line. Git reads
-  // one-shot config from the child environment instead, and errors are still redacted.
-  // Reconcile remote-first changes (e.g. edits made directly on GitHub web)
-  // so a stale local branch never blocks publishing with a non-fast-forward.
-  report(46, '正在获取 GitHub 上的最新版本');
-  const fetch = await gitNetwork(['fetch', 'github', targetBranch], authConfig);
-  let newRemoteBranch = false;
-  if (fetch.code !== 0 && force) {
-    const probe = await gitNetwork(['ls-remote', 'github', `refs/heads/${targetBranch}`], authConfig);
-    newRemoteBranch = probe.code === 0 && !probe.stdout.trim();
-  }
-  if (fetch.code !== 0 && !newRemoteBranch) throw new Error(`git fetch 失败：${safeGitFailure(fetch, token)}`);
-  let remoteSha = '';
-  if (!newRemoteBranch) {
-    const remoteHead = await git(['rev-parse', 'FETCH_HEAD']);
-    remoteSha = remoteHead.code === 0 ? remoteHead.stdout.trim() : '';
-    if (!/^[0-9a-f]{40}$/i.test(remoteSha)) throw new Error('无法确定远程分支基线，已停止发布。');
-  }
-  if (!newRemoteBranch && !force) {
-    report(64, '正在检查远程差异');
-    const remoteOnly = await git(['rev-list', '--count', 'FETCH_HEAD', '--not', 'HEAD']);
-    if (Number(remoteOnly.stdout.trim() || '0') > 0) {
-      report(73, '正在安全整合远程修改');
-      const rebase = await git(['rebase', 'FETCH_HEAD']);
-      if (rebase.code !== 0) {
-        await git(['rebase', '--abort']);
-        throw new Error('远程包含与本地冲突的修改，已安全中止。请先在 GitHub 上查看远程改动再发布。');
-      }
-    }
-  }
-  report(86, force ? '正在使用远程租约安全替换当前源码' : '正在推送到 GitHub');
-  const push = await gitNetwork(publishPushArguments(targetBranch, { force, newRemoteBranch, remoteSha }), authConfig);
-  if (push.code !== 0) throw new Error(`push 失败：${safeGitFailure(push, token)}`);
-  report(100, '源码已推送，GitHub Actions 正在构建');
-  return { message: commitMessage ? `已推送 ${commitMessage}` : `已推送到 ${targetBranch} 分支` };
-}
-
 // 博客预览由 admin server 自己托管 public/（见底部 blogServer），
 // 不再探测外部 hugo server，因此恒为运行中。
 const blogHost = process.env.BLOG_HOST || '0.0.0.0';
@@ -1091,10 +874,36 @@ const {
   maxOutputBytes: 16 * 1024,
 });
 
-const { atomicWrite, atomicCreate, copyWithoutClobber } = createAtomicFileService({
+const { stageFile, atomicWrite, atomicCreate, copyWithoutClobber } = createAtomicFileService({
   scheduleBuild,
   httpError,
   relativeToRepo,
+});
+
+const fileTransaction = createFileTransactionService({
+  stageFile,
+  atomicWrite,
+  scheduleBuild,
+});
+
+const siteSettings = createSiteSettingsService({
+  repoRoot,
+  siteDataFile,
+  themeRoot,
+  fileTransaction,
+  atomicWrite,
+  httpError,
+  maxBodyBytes,
+});
+
+const publishService = createPublishService({
+  repoRoot,
+  trashRoot,
+  exists,
+  atomicWrite,
+  git,
+  gitNetwork,
+  safeGitFailure,
 });
 
 async function handleApi(req, res, url) {
@@ -1118,6 +927,8 @@ async function handleApi(req, res, url) {
     const destination = path.join(contentRoot, 'posts', plan.slug);
     if (await exists(destination)) return fail(res, 409, '目标文章目录已存在。');
     await fs.mkdir(destination, { recursive: true });
+    const createdStatic = [];
+    const publicSnapshots = [];
     try {
       // 先验证会写入的 static 资源，防止导入完成一半才发现同名文件冲突。
       for (const copy of plan.staticCopies || []) {
@@ -1142,12 +953,26 @@ async function handleApi(req, res, url) {
       for (const copy of plan.staticCopies || []) {
         const dest = inside(repoRoot, copy.to);
         if (!dest) continue;
-        await copyWithoutClobber(copy.from, dest);
+        const copyResult = await copyWithoutClobber(copy.from, dest);
+        if (copyResult === 'created') createdStatic.push(dest);
+
         const publicDest = path.join(repoRoot, 'public', ...copy.to.replace(/^static\//, '').split('/'));
+        const previousPublic = await fs.readFile(publicDest).then((bytes) => ({ existed: true, bytes })).catch((error) => {
+          if (error?.code === 'ENOENT') return { existed: false, bytes: null };
+          throw error;
+        });
+        publicSnapshots.push({ target: publicDest, ...previousPublic });
         await atomicWrite(publicDest, await fs.readFile(copy.from), { schedule: false });
       }
       scheduleBuild();
     } catch (error) {
+      for (const snapshot of publicSnapshots.reverse()) {
+        try {
+          if (snapshot.existed) await atomicWrite(snapshot.target, snapshot.bytes, { schedule: false });
+          else await fs.rm(snapshot.target, { force: true });
+        } catch {}
+      }
+      await Promise.all(createdStatic.map((target) => fs.rm(target, { force: true }).catch(() => {})));
       await fs.rename(destination, path.join(trashRoot, `failed-import-${randomUUID()}`)).catch(() => {});
       throw error;
     }
@@ -1183,34 +1008,15 @@ async function handleApi(req, res, url) {
     return;
   }
   if (req.method === 'GET' && pathname === '/api/drawers') return send(res, 200, await readDrawers());
-  if (req.method === 'GET' && pathname === '/api/friends') return send(res, 200, await readFriends());
-  if (req.method === 'GET' && pathname === '/api/profile') return send(res, 200, await readProfile());
+  if (req.method === 'GET' && pathname === '/api/friends') return send(res, 200, await siteSettings.readFriends());
+  if (req.method === 'GET' && pathname === '/api/profile') return send(res, 200, await siteSettings.readProfile());
   if (req.method === 'PUT' && pathname === '/api/profile') {
     const request = JSON.parse((await readBody(req)).toString('utf8'));
-    const raw = await fs.readFile(siteDataFile, 'utf8');
-    if (request.version !== createHash('sha256').update(raw).digest('hex')) return fail(res, 409, '个人资料已在别处修改，请刷新后重试。');
-    const profile = validateProfile(request.profile);
-    const document = YAML.parseDocument(raw, { prettyErrors: true, uniqueKeys: true });
-    if (document.errors.length) throw httpError(400, `站点数据 YAML 无效：${document.errors[0].message}`);
-    for (const [key, value] of Object.entries(profile)) document.set(key, value);
-    const tomlPath = path.join(repoRoot, 'hugo.toml');
-    const toml = await fs.readFile(tomlPath, 'utf8');
-    await atomicWrite(siteDataFile, String(document), { schedule: false });
-    await atomicWrite(tomlPath, patchTomlValue(toml, 'params.author', profile.author), { schedule: false });
-    scheduleBuild();
-    return send(res, 200, { ok: true, ...await readProfile() });
+    return send(res, 200, await siteSettings.updateProfile(request));
   }
   if (req.method === 'PUT' && pathname === '/api/friends') {
     const request = JSON.parse((await readBody(req)).toString('utf8'));
-    const raw = await fs.readFile(siteDataFile, 'utf8');
-    const version = createHash('sha256').update(raw).digest('hex');
-    if (request.version !== version) return fail(res, 409, '友链配置已在别处修改，请刷新后重试。');
-    const friends = validateFriends(request.friends);
-    const document = YAML.parseDocument(raw, { prettyErrors: true, uniqueKeys: true });
-    if (document.errors.length) throw httpError(400, `站点数据 YAML 无效：${document.errors[0].message}`);
-    document.set('friends', friends);
-    await atomicWrite(siteDataFile, String(document));
-    return send(res, 200, { ok: true, ...await readFriends() });
+    return send(res, 200, await siteSettings.updateFriends(request));
   }
   if (req.method === 'PUT' && pathname === '/api/drawers') {
     const request = JSON.parse((await readBody(req)).toString('utf8'));
@@ -1506,40 +1312,15 @@ async function handleApi(req, res, url) {
     return send(res, 200, { ok: true, backup: relativeToRepo(backup) });
   }
   if (req.method === 'GET' && pathname === '/api/settings') {
-    const raw = await fs.readFile(path.join(repoRoot, 'hugo.toml'), 'utf8');
-    const schema = JSON.parse(await fs.readFile(path.join(themeRoot, 'theme-config.schema.json'), 'utf8'));
-    return send(res, 200, { raw, ...parseToml(raw), schema });
+    return send(res, 200, await siteSettings.readSettings());
   }
   if (req.method === 'PATCH' && pathname === '/api/settings') {
     const request = JSON.parse((await readBody(req)).toString('utf8'));
-    const schema = JSON.parse(await fs.readFile(path.join(themeRoot, 'theme-config.schema.json'), 'utf8'));
-    const values = validateThemeSettingsPatch(schema, request.values || {});
-    const menus = request.menus === undefined ? null : validateMenus(request.menus);
-    let raw = await fs.readFile(path.join(repoRoot, 'hugo.toml'), 'utf8');
-    for (const [fieldPath, value] of Object.entries(values)) raw = patchTomlValue(raw, fieldPath, value);
-    if (menus) raw = patchMenus(raw, menus);
-    await atomicWrite(path.join(repoRoot, 'hugo.toml'), raw);
-    // The about page renders the avatar from data/site.yaml (hugo.Data.site),
-    // so keep it in sync whenever params.avatar changes.
-    const hasAvatar = Object.hasOwn(values, 'params.avatar');
-    const hasAuthor = Object.hasOwn(values, 'params.author');
-    if (hasAvatar || hasAuthor) {
-      const siteRaw = await fs.readFile(siteDataFile, 'utf8');
-      const document = YAML.parseDocument(siteRaw, { prettyErrors: true, uniqueKeys: true });
-      if (document.errors.length) throw httpError(400, `站点数据 YAML 无效：${document.errors[0].message}`);
-      if (hasAvatar) document.set('avatar', values['params.avatar']);
-      if (hasAuthor) document.set('author', values['params.author']);
-      await atomicWrite(siteDataFile, String(document));
-    }
-    scheduleBuild();
-    return send(res, 200, { ok: true, ...parseToml(raw) });
+    return send(res, 200, await siteSettings.patchSettings(request));
   }
   if (req.method === 'PUT' && pathname === '/api/settings') {
     const request = JSON.parse((await readBody(req)).toString('utf8'));
-    if (typeof request.raw !== 'string' || request.raw.length > maxBodyBytes) return fail(res, 400, '配置内容无效。');
-    await atomicWrite(path.join(repoRoot, 'hugo.toml'), request.raw);
-    scheduleBuild();
-    return send(res, 200, { ok: true });
+    return send(res, 200, await siteSettings.replaceSettingsRaw(request));
   }
   if (req.method === 'GET' && pathname === '/api/modules') {
     const { modules, usage } = await moduleUsage();
@@ -1669,16 +1450,16 @@ async function handleApi(req, res, url) {
   }
   if (req.method === 'GET' && pathname === '/api/publish/status') {
     const remote = await git(['remote', 'get-url', 'github']);
-    const targetRemote = await publishRemote();
+    const targetRemote = await publishService.remote();
     const remoteOk = Boolean(targetRemote) && remote.code === 0 && remote.stdout.trim().toLowerCase().replace(/\.git$/, '') === targetRemote.toLowerCase().replace(/\.git$/, '');
     let commitsAhead = '0';
     try { const ahead = await git(['rev-list', '--count', 'HEAD', '--not', '--remotes=github']); commitsAhead = ahead.stdout.trim() || '0'; } catch {}
     return send(res, 200, {
       allowedRemote: targetRemote.replace(/\.git$/, ''),
-      allowedBranch: await publishBranch(),
+      allowedBranch: await publishService.branch(),
       remote: remote.code === 0 ? remote.stdout.trim() : '',
       remoteOk,
-      tokenPresent: Boolean(await findTokenFile()),
+      tokenPresent: await publishService.tokenPresent(),
       systemProxyDetected: Boolean(await systemGitProxy()),
       workflowPresent: await exists(path.join(repoRoot, '.github', 'workflows', 'hugo.yaml')),
       branch: (await git(['branch', '--show-current'])).stdout.trim(),
@@ -1688,34 +1469,23 @@ async function handleApi(req, res, url) {
     });
   }
   if (req.method === 'PUT' && pathname === '/api/publish/target') {
-    const request = JSON.parse((await readBody(req, 4096)).toString('utf8'));
-    const targetRemote = String(request.remote || '').trim();
-    const targetBranch = String(request.branch || 'main').trim();
-    if (!validBlogRemote(targetRemote)) return fail(res, 400, '请输入完整的 GitHub HTTPS 仓库地址。');
-    if (!validPublishBranch(targetBranch)) return fail(res, 400, '发布分支名无效。');
     if (publishState?.status === 'running') return fail(res, 409, '发布进行中，暂不能切换目标。');
-    const current = await git(['remote', 'get-url', 'github']);
-    const previous = current.code === 0 ? current.stdout.trim() : '';
-    const expected = await publishRemote();
-    if (previous && previous.toLowerCase().replace(/\.git$/, '') !== expected.toLowerCase().replace(/\.git$/, '')) return fail(res, 409, 'Git 远程已被其他程序修改，请先核对当前地址。');
-    const update = await git(previous ? ['remote', 'set-url', 'github', targetRemote] : ['remote', 'add', 'github', targetRemote]);
-    if (update.code !== 0) return fail(res, 500, update.stderr || '无法更新 Git 远程。');
-    try { await atomicWrite(localConfigFile, `${JSON.stringify({ ...(await readPublishConfig()), publishRemote: targetRemote, publishBranch: targetBranch }, null, 2)}\n`, { schedule: false }); }
-    catch (error) {
-      await git(previous ? ['remote', 'set-url', 'github', previous] : ['remote', 'remove', 'github']);
-      throw error;
+    try {
+      const request = JSON.parse((await readBody(req, 4096)).toString('utf8'));
+      const result = await publishService.setTarget(request.remote, request.branch);
+      return send(res, 200, { ok: true, ...result });
+    } catch (error) {
+      return fail(res, Number.isInteger(error.statusCode) ? error.statusCode : 500, error.message || '无法更新发布目标。');
     }
-    return send(res, 200, { ok: true, remote: targetRemote, branch: targetBranch });
   }
   if (req.method === 'PUT' && pathname === '/api/publish/token') {
     if (publishState?.status === 'running') return fail(res, 409, '发布进行中，暂不能修改认证令牌。');
-    const request = JSON.parse((await readBody(req, 4096)).toString('utf8'));
-    const token = validatePublishToken(request.token);
-    if (!token) return fail(res, 400, '令牌格式无效：应为只含字母、数字或下划线的 20–2048 个字符。');
-    const tokenFile = path.join(repoRoot, '.token');
-    await atomicWrite(tokenFile, `${token}\n`, { schedule: false });
-    await fs.chmod(tokenFile, 0o600).catch(() => {});
-    return send(res, 200, { ok: true, tokenPresent: true });
+    try {
+      const request = JSON.parse((await readBody(req, 4096)).toString('utf8'));
+      return send(res, 200, { ok: true, ...(await publishService.saveToken(request.token)) });
+    } catch (error) {
+      return fail(res, Number.isInteger(error.statusCode) ? error.statusCode : 500, error.message || '无法保存认证令牌。');
+    }
   }
   if (req.method === 'GET' && pathname === '/api/publish/progress') {
     const id = url.searchParams.get('id');
@@ -1736,7 +1506,7 @@ async function handleApi(req, res, url) {
       publishState.progress = Math.max(publishState.progress, Math.min(100, Number(progress) || 0));
       publishState.stage = String(stage || publishState.stage).slice(0, 160);
     };
-    void publishToBlog(commitMessage, force, report).then((result) => {
+    void publishService.publishToBlog(commitMessage, force, report).then((result) => {
       publishState.status = 'complete';
       publishState.progress = 100;
       publishState.stage = '发布完成';

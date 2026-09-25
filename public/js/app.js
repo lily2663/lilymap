@@ -1,4 +1,4 @@
-import { api, beginOperation, endOperation, trackedFetch, updateOperation } from './core/api.js';
+import { api, trackedFetch } from './core/api.js';
 import { $, esc, toast } from './core/dom.js';
 import { allowedViews, state } from './core/state.js';
 import { decorateNavigation } from './core/icons.js';
@@ -7,6 +7,9 @@ import { selectOptionIndex, selectOptionLabel, selectOptionValue } from './core/
 import { renderModules, leaveModuleEditor } from './features/module-library.js';
 import { renderPublish } from './features/publish.js';
 import { renderAppearance } from './features/appearance.js';
+import { createImportFeature } from './features/importer.js';
+import { renderResources } from './features/resources.js';
+import { renderSettings } from './features/settings.js';
 
 decorateNavigation();
 
@@ -283,149 +286,6 @@ function renderProfile() {
 async function showImporter() {
   setView("import");
 }
-function importPage() {
-  $("#main").innerHTML =
-    page(
-      "导入 Typora Markdown",
-      "拖入 .md 与其图片目录（可一起拖入整个文章文件夹），或点击下方按钮选择；正文保持原样。",
-    ) +
-    `<section id="drop" class="drop"><h2>拖入 Markdown / 文章目录 / 图片</h2><p>自动读取 Front Matter、识别图片引用并归位到 Page Bundle。</p><button class="btn primary" id="choose-md">选择 Markdown 与图片</button> <button class="btn" id="choose-folder">选择文章目录</button></section><div id="plan"></div>`;
-  let d = $("#drop");
-  ["dragenter", "dragover"].forEach((x) =>
-    d.addEventListener(x, (e) => {
-      e.preventDefault();
-      d.classList.add("over");
-    }),
-  );
-  ["dragleave", "drop"].forEach((x) =>
-    d.addEventListener(x, (e) => {
-      e.preventDefault();
-      d.classList.remove("over");
-    }),
-  );
-  d.addEventListener("drop", async (e) => {
-    let items = await collectDropFiles(e.dataTransfer);
-    readFiles(items);
-  });
-  $("#choose-md").onclick = () => $("#file-picker").click();
-  $("#choose-folder").onclick = () => $("#folder-picker").click();
-  bindCommon();
-}
-async function collectDropFiles(dt) {
-  let out = [];
-  let entries = [...(dt.items || [])]
-    .map((i) => {
-      try {
-        return i.webkitGetAsEntry && i.webkitGetAsEntry();
-      } catch {
-        return null;
-      }
-    })
-    .filter(Boolean);
-  if (entries.length) {
-    for (let en of entries) await walkDropEntry(en, "", out);
-    if (out.length) return out;
-  }
-  return [...dt.files].map((f) => ({
-    file: f,
-    relativePath: f.webkitRelativePath || f.name,
-  }));
-}
-async function walkDropEntry(en, prefix, out) {
-  if (en.isFile) {
-    let f = await new Promise((r, j) => en.file(r, j));
-    out.push({ file: f, relativePath: prefix + en.name });
-  } else if (en.isDirectory) {
-    let rd = en.createReader();
-    let batch;
-    do {
-      batch = await new Promise((r, j) => rd.readEntries(r, j));
-      for (let ce of batch)
-        await walkDropEntry(ce, prefix + en.name + "/", out);
-    } while (batch.length);
-  }
-}
-async function readFiles(files) {
-  const operation = beginOperation(`正在读取文件 0/${files.length}`);
-  try {
-    let payload = [];
-    for (let f of files) {
-      let file = f.file || f;
-      payload.push({
-        name: file.name,
-        relativePath:
-          f.relativePath || file.webkitRelativePath || file.name,
-        type: file.type,
-        content: await as64(file),
-      });
-      updateOperation(operation, `正在读取文件 ${payload.length}/${files.length}`);
-    }
-    state.import = { payload };
-    await runInspect();
-  } catch (e) {
-    toast(e.message);
-  } finally { endOperation(operation); }
-}
-async function runInspect() {
-  try {
-    let payload = state.import.payload;
-    let plan = await api("/api/import/inspect", {
-      method: "POST",
-      body: JSON.stringify({ files: payload }),
-    });
-    state.import.plan = plan;
-    let missing = plan.missing || [];
-    $("#plan").innerHTML =
-      `<div class="import-plan"><h2>确认导入</h2><div class="kv"><span>标题</span><b>${esc(plan.title)}</b></div><div class="kv"><span>目标路径</span><b class="path">content/posts/${esc(plan.slug)}/index.md</b></div><div class="kv"><span>Front Matter</span><b>${plan.hasFrontMatter ? "已识别，保持原样" : "未发现，将补充最小 Hugo Front Matter"}</b></div><div class="kv"><span>关联资源</span><b>${plan.assetCount} 个${missing.length ? `；<span style="color:var(--danger)">缺少 ${missing.length} 张图片</span>` : ""}</b></div>${plan.rewriteCount ? `<div class="kv"><span>本地图片引用</span><b>自动改写 ${plan.rewriteCount} 处为博客路径</b></div>` : ""}${missing.length ? `<div class="kv"><span>缺失图片</span><b class="path" style="color:var(--danger)">${esc(missing.join("<br>"))}</b></div><p><label class="btn primary" style="display:inline-block">补选缺失图片（可多选）<input id="missing-pick" type="file" accept="image/*" multiple hidden></label> <span class="muted">按文件名自动匹配归位，选完自动重新检查</span></p>` : ""}<label class="switch"><span><b>发布为草稿</b><p>没有 Front Matter 时默认安全导入为草稿</p></span><input id="import-draft" type="checkbox" checked></label><p><button class="btn primary" id="confirm-import">导入</button> <button class="btn" id="cancel-import">取消</button></p></div>`;
-    let pick = $("#missing-pick");
-    if (pick)
-      pick.onchange = async (e) => {
-        let extra = [...e.target.files];
-        if (!extra.length) return;
-        for (let f of extra)
-          state.import.payload.push({
-            name: f.name,
-            relativePath: f.name,
-            type: f.type,
-            content: await as64(f),
-          });
-        toast("已补选 " + extra.length + " 张图片，重新检查引用…");
-        await runInspect();
-      };
-    $("#confirm-import").onclick = async () => {
-      try {
-        let r = await api("/api/import", {
-          method: "POST",
-          body: JSON.stringify({
-            files: payload,
-            draft: $("#import-draft").checked,
-          }),
-        });
-        toast(
-          `已导入 ${r.path}${r.assetCount ? `（含 ${r.assetCount} 张图片）` : ""}`,
-        );
-        await refresh();
-        setView("articles");
-        openArticle(r.path);
-      } catch (e) {
-        toast(e.message);
-      }
-    };
-    $("#cancel-import").onclick = () => {
-      $("#plan").innerHTML = "";
-      state.import = null;
-    };
-  } catch (e) {
-    toast(e.message);
-  }
-}
-async function as64(f) {
-  let b = await f.arrayBuffer(),
-    a = new Uint8Array(b),
-    s = "";
-  for (let x of a) s += String.fromCharCode(x);
-  return btoa(s);
-}
 async function openArticle(path) {
   let d = await api("/api/post?path=" + encodeURIComponent(path)),
     p = d.article;
@@ -607,190 +467,6 @@ async function openArticle(path) {
     toast("已移入回收区。");
     refresh();
   };
-}
-async function resources() {
-  let files = await api("/api/files"),
-    bundles = {};
-  for (let p of state.posts.filter((x) => x.kind === "bundle"))
-    bundles[p.directory] = p;
-  let article = files.files.filter((f) =>
-      Object.keys(bundles).some(
-        (d) =>
-          f.path.startsWith(d + "/") && !f.path.endsWith("/index.md"),
-      ),
-    ),
-    site = files.files.filter((f) => f.scope === "public" && f.publicPath),
-    pipeline = files.files.filter((f) => f.scope === "pipeline");
-  let mediaPreview = (f, source) => {
-    if (f.kind === "image") return `<img src="${esc(source)}" alt="" loading="lazy" decoding="async">`;
-    if (f.kind === "video") return `<video src="${esc(source)}" muted loop playsinline preload="metadata"></video>`;
-    return `<div class="file-badge">${esc(f.extension || "file")}</div>`;
-  };
-  let siteCards =
-    site
-      .map((f) => {
-        return `<div class="asset-card"><div class="asset-prev">${mediaPreview(f, f.publicPath)}</div><div class="asset-meta"><b>${esc(f.path.split("/").pop())}</b><span class="path" title="磁盘：${esc(f.path)}">公开：${esc(f.publicPath)}</span><small class="muted">${readableBytes(f.size)} · ${esc((f.extension || "file").toUpperCase())}</small><div class="asset-actions"><button class="btn mini" data-copy="${esc(f.publicPath)}">复制公开路径</button>${f.path.startsWith('static/assets/') && ['image', 'video'].includes(f.kind) ? `<button class="btn mini" data-file-action="replace" data-file-path="${esc(f.path)}">替换</button><button class="btn mini" data-file-action="rename" data-file-path="${esc(f.path)}">重命名</button><button class="btn mini danger" data-file-action="delete" data-file-path="${esc(f.path)}">删除</button>` : ''}</div></div></div>`;
-      })
-      .join("") || '<div class="empty">暂无站点资源。</div>';
-  state.resCopy = (v) => {
-    navigator.clipboard
-      .writeText(v)
-      .then(() => toast("已复制：" + v))
-      .catch(() => toast("复制失败"));
-  };
-  $("#main").innerHTML =
-    page(
-      "资源",
-      "站点资源只写入 static/assets，并自动换算为稳定的 /assets/... 公开路径。",
-    ) +
-    `<section class="section"><div class="security-note"><span aria-hidden="true">✓</span><p><strong>路径规则已统一</strong>磁盘位置是 static/assets/...；Hugo 与线上使用 /assets/...。源码管线 assets/ 不再伪装成可直接访问 URL。</p></div><h2>站点资源</h2><p class="muted">可以上传、替换、重命名或移入回收区。重命名及删除前请检查文章和配置中的引用。</p><label class="upload-btn btn primary">+ 上传图片<input id="res-upload" type="file" accept="image/png,image/jpeg,image/webp,image/gif,image/avif" multiple hidden></label><div class="asset-grid">${siteCards}</div></section>${pipeline.length ? `<section class="section"><h2>Hugo 资源管线（不直接公开）</h2><div class="security-note"><span aria-hidden="true">i</span><p><strong>${pipeline.length} 个 assets/ 源文件</strong>这些文件需要模板处理后才有 URL，LilyMap 不再生成误导性的公开路径。</p></div></section>` : ""}<section class="section"><h2>文章图片</h2>${article.length ? `<div class="asset-grid">${article.map((f) => `<div class="asset-card"><div class="asset-prev">${mediaPreview(f, "/" + f.path)}</div><div class="asset-meta"><b>${esc(f.path.split("/").pop())}</b><span class="path">${esc(Object.entries(bundles).find(([d]) => f.path.startsWith(d + "/"))?.[1]?.title || f.path)}</span><div class="asset-actions"><button class="btn mini" data-copy="${esc(f.path.split("/").pop())}">复制文件名</button>${f.kind === 'image' ? `<button class="btn mini" data-file-action="replace" data-file-path="${esc(f.path)}">替换</button><button class="btn mini" data-file-action="rename" data-file-path="${esc(f.path)}">重命名</button><button class="btn mini danger" data-file-action="delete" data-file-path="${esc(f.path)}">删除</button>` : ''}</div></div></div>`).join("")}</div>` : '<div class="empty">尚未发现 Page Bundle 图片。</div>'}</section>`;
-  bindCommon();
-  document.querySelectorAll(".asset-prev video").forEach((video) => {
-    video.addEventListener("pointerenter", () => { void video.play().catch(() => {}); });
-    video.addEventListener("pointerleave", () => video.pause());
-  });
-  document
-    .querySelectorAll("[data-copy]")
-    .forEach((b) => (b.onclick = () => state.resCopy(b.dataset.copy)));
-  document.querySelectorAll('[data-file-action]').forEach((button) => button.onclick = async () => {
-    const filePath = button.dataset.filePath, action = button.dataset.fileAction;
-    try {
-      if (action === 'rename') {
-        const name = window.prompt('新文件名（扩展名保持不变）。引用旧路径的文章或配置需要手动更新。', filePath.split('/').pop());
-        if (!name || name === filePath.split('/').pop()) return;
-        await api(`/api/file?path=${encodeURIComponent(filePath)}`, { method: 'PATCH', body: JSON.stringify({ name }) });
-      } else if (action === 'delete') {
-        if (!confirm(`将 ${filePath} 移入回收区？引用它的页面可能需要更新。`)) return;
-        await api(`/api/file?path=${encodeURIComponent(filePath)}`, { method: 'DELETE' });
-      } else {
-        const chooser = document.createElement('input'); chooser.type = 'file';
-        chooser.accept = filePath.endsWith('.mp4') ? 'video/mp4' : 'image/*';
-        chooser.onchange = async () => {
-          const file = chooser.files?.[0]; if (!file) return;
-          if (file.name.split('.').pop().toLowerCase() !== filePath.split('.').pop().toLowerCase()) return toast('替换文件需要保持原扩展名。');
-          try { await trackedFetch(`/api/file?path=${encodeURIComponent(filePath)}`, { method: 'PUT', body: file }, '正在替换资源').then(async (response) => { if (!response.ok) throw Error((await response.json()).error || '替换失败'); }); toast('资源已替换，旧文件留在回收区。'); await resources(); }
-          catch (error) { toast(error.message); }
-        };
-        chooser.click(); return;
-      }
-      toast('资源操作已完成。'); await resources();
-    } catch (error) { toast(error.message); }
-  });
-  let up = $("#res-upload");
-  up.onchange = async () => {
-    let ok = 0,
-      fail = 0;
-    await Promise.all(
-      [...up.files].map(async (f) => {
-        try {
-          let r = await trackedFetch(
-            "/api/asset/upload?name=" +
-              encodeURIComponent(f.name) +
-              "&area=static/assets/img",
-            {
-              method: "POST",
-              headers: { "content-type": f.type },
-              body: f,
-            }, `正在上传 ${f.name}`,
-          );
-          r.ok ? ok++ : fail++;
-        } catch {
-          fail++;
-        }
-      }),
-    );
-    toast(`上传完成：成功 ${ok} 个${fail ? `，失败 ${fail} 个` : ""}`);
-    await resources();
-  };
-}
-function settingField(f, v) {
-  let value = v ?? f.default ?? "",
-    help = f.help || f.path;
-  if (f.type === "boolean")
-    return `<label class="switch"><span><b>${esc(f.label)}</b><p>${esc(help)}</p></span><input data-config="${f.path}" type="checkbox" ${value ? "checked" : ""}></label>`;
-  if (f.type === "select")
-    return `<label class="field"><span>${esc(f.label)}</span><select data-config="${f.path}">${(f.options || []).map((o) => `<option value="${esc(o.value)}" ${o.value === value ? "selected" : ""}>${esc(o.label)}</option>`).join("")}</select><small class="muted">${esc(help)}</small></label>`;
-  let type =
-    f.type === "number"
-      ? "number"
-      : f.type === "color"
-        ? "color"
-        : f.type === "url"
-          ? "url"
-          : "text";
-  let limits = f.type === "number"
-    ? ["min", "max", "step"].filter((key) => Object.hasOwn(f, key)).map((key) => `${key}="${esc(f[key])}"`).join(" ")
-    : "";
-  return `<label class="field"><span>${esc(f.label)}</span><input data-config="${f.path}" type="${type}" value="${esc(value)}" ${limits}><small class="muted">${esc(help)}</small></label>`;
-}
-async function settings() {
-  let d = await api("/api/settings");
-  state.settings = d;
-  let fields = d.schema.sections
-    .map(
-      (s, i) =>
-        `<details ${i < 2 || s.id === "mobileLayout" ? "open" : ""}><summary>${esc(s.label)}</summary><div class="settings-grid">${s.fields.map((f) => settingField(f, d.values[f.path])).join("")}</div></details>`,
-    )
-    .join("");
-  $("#main").innerHTML =
-    page(
-      "博客设置",
-      "模块化管理站点身份、视觉、阅读与交互；保存后由 Hugo 自动重建。",
-    ) +
-    `<div class="settings">${fields}<details><summary>导航</summary><div id="menus"></div><button class="btn" id="add-menu">添加菜单</button></details><p><button class="btn primary" id="save-settings">保存设置</button></p><details><summary>高级配置：hugo.toml 原文</summary><label class="field"><textarea id="raw-settings">${esc(d.raw)}</textarea></label><p><button class="btn" id="save-raw-settings">保存原文</button></p></details></div>`;
-  function menu(m = { name: "新菜单", url: "/", weight: 60 }) {
-    return `<div class="menu-item"><input data-menu="name" value="${esc(m.name)}"><input data-menu="url" value="${esc(m.url)}"><input data-menu="weight" type="number" value="${esc(m.weight)}"><button class="btn">删除</button></div>`;
-  }
-  let menus = $("#menus");
-  menus.innerHTML = d.menus.map(menu).join("");
-  $("#add-menu").onclick = () =>
-    menus.insertAdjacentHTML("beforeend", menu());
-  document
-    .querySelectorAll(".menu-item button")
-    .forEach((b) => (b.onclick = () => b.parentElement.remove()));
-  $("#save-settings").onclick = async () => {
-    try {
-      let values = {};
-      d.schema.sections
-        .flatMap((s) => s.fields)
-        .forEach((f) => {
-          let e = document.querySelector(`[data-config="${f.path}"]`);
-          values[f.path] =
-            f.type === "boolean"
-              ? e.checked
-              : f.type === "number"
-                ? Number(e.value)
-                : e.value;
-        });
-      let nextMenus = [...document.querySelectorAll(".menu-item")].map(
-        (e) => ({
-          name: e.querySelector("[data-menu=name]").value,
-          url: e.querySelector("[data-menu=url]").value,
-          weight: Number(e.querySelector("[data-menu=weight]").value),
-        }),
-      );
-      await api("/api/settings", {
-        method: "PATCH",
-        body: JSON.stringify({ values, menus: nextMenus }),
-      });
-      toast("模块设置已保存；Hugo 正在重建。");
-      await refresh();
-    } catch (e) {
-      toast(e.message);
-    }
-  };
-  $("#save-raw-settings").onclick = async () => {
-    try {
-      await api("/api/settings", {
-        method: "PUT",
-        body: JSON.stringify({ raw: $("#raw-settings").value }),
-      });
-      toast("hugo.toml 已保存。");
-    } catch (e) {
-      toast(e.message);
-    }
-  };
-  bindCommon();
 }
 function version() {
   let s = state.status || { repoRoot: "", branch: "-", changes: [] };
@@ -1050,6 +726,8 @@ async function layouts() {
 async function modules() {
   await renderModules({ page, bindCommon, navigate: setView });
 }
+const importFeature = createImportFeature({ page, bindCommon, setView, refresh, openArticle });
+
 async function render() {
   nav();
   if (state.view === "overview") overview();
@@ -1057,12 +735,12 @@ async function render() {
   else if (state.view === "drawers") await drawers();
   else if (state.view === "friends") await friends();
   else if (state.view === "profile") await profile();
-  else if (state.view === "import") importPage();
+  else if (state.view === "import") importFeature.render();
   else if (state.view === "layouts") await layouts();
   else if (state.view === "modules") await modules();
   else if (state.view === "appearance") await renderAppearance({ page, bindCommon });
-  else if (state.view === "resources") await resources();
-  else if (state.view === "settings") await settings();
+  else if (state.view === "resources") await renderResources({ page, bindCommon });
+  else if (state.view === "settings") await renderSettings({ page, bindCommon, refresh });
   else if (state.view === "publish") await renderPublish({ page, bindCommon });
   else version();
 }
@@ -1072,8 +750,8 @@ document.querySelectorAll("#nav button").forEach(
       setView(b.dataset.view);
     }),
 );
-$("#file-picker").onchange = (e) => readFiles([...e.target.files]);
-$("#folder-picker").onchange = (e) => readFiles([...e.target.files]);
+$("#file-picker").onchange = (e) => importFeature.readFiles([...e.target.files]);
+$("#folder-picker").onchange = (e) => importFeature.readFiles([...e.target.files]);
 refresh().catch((e) => {
   $("#main").innerHTML =
     '<div class="empty">无法连接 lilymap API：' +

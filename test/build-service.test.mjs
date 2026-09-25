@@ -67,3 +67,26 @@ test('scheduled builds can be cancelled before execution', async () => {
   assert.equal(spawned, 0);
   assert.equal(service.snapshot().status, 'idle');
 });
+
+
+test('build service surfaces process-runner timeouts as bounded build errors', async () => {
+  const calls = [];
+  const service = createBuildService({
+    repoRoot: '/tmp/blog',
+    hugoExecutable: 'hugo',
+    buildTimeoutMs: 2500,
+    processRunner: {
+      run: async (command, args, options) => {
+        calls.push({ command, args, options });
+        return { code: 1, stdout: '', stderr: '', output: '', timedOut: true, aborted: false, error: 'process timed out' };
+      },
+    },
+  });
+
+  const result = await service.runBuild(false, 'timeout-test');
+  assert.equal(result.code, 1);
+  assert.equal(result.build.status, 'error');
+  assert.match(result.output, /超过 3 秒/);
+  assert.equal(calls[0].command, 'hugo');
+  assert.equal(calls[0].options.timeoutMs, 2500);
+});
