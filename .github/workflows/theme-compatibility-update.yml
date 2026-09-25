@@ -16,8 +16,8 @@ jobs:
       ref: ${{ steps.upstream.outputs.ref }}
       changed: ${{ steps.upstream.outputs.changed }}
     steps:
-      - uses: actions/checkout@v6
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 22
       - name: Read latest theme commit
@@ -42,14 +42,14 @@ jobs:
     if: needs.discover.outputs.changed == 'true'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 22
       - name: Update proposed compatibility pin
         run: node .github/scripts/update-theme-compatibility.mjs '${{ needs.discover.outputs.ref }}'
       - name: Open compatibility update PR
-        uses: peter-evans/create-pull-request@v7
+        uses: peter-evans/create-pull-request@22a9089034f40e5a961c8808d113e2c98fb63676 # v7
         with:
           branch: automation/theme-compatibility-update
           delete-branch: true
