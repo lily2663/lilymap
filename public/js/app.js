@@ -714,7 +714,9 @@ function settingField(f, v) {
       ? "number"
       : f.type === "color"
         ? "color"
-        : "text";
+        : f.type === "url"
+          ? "url"
+          : "text";
   let limits = f.type === "number"
     ? ["min", "max", "step"].filter((key) => Object.hasOwn(f, key)).map((key) => `${key}="${esc(f[key])}"`).join(" ")
     : "";
