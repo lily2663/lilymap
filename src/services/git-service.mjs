@@ -1,6 +1,5 @@
-import { spawn } from 'node:child_process';
-
 import { redactGitCredentials } from '../domain/publish-security.mjs';
+import { createProcessRunner } from './process-runner.mjs';
 
 export function gitEnvironment(config = [], baseEnv = process.env) {
   const env = { ...baseEnv, GIT_TERMINAL_PROMPT: '0' };
@@ -23,27 +22,30 @@ export function isTransientGitNetworkFailure(result) {
 
 export function createGitService({
   repoRoot,
-  spawnProcess = spawn,
+  spawnProcess,
+  processRunner,
   platform = process.platform,
   environment = process.env,
+  timeoutMs = 60_000,
 }) {
   let proxyCache;
+  const runner = processRunner || createProcessRunner({
+    ...(spawnProcess ? { spawnProcess } : {}),
+    defaultTimeoutMs: timeoutMs,
+    defaultMaxOutputBytes: 128 * 1024,
+  });
 
-  function run(command, args, options = {}) {
-    return new Promise((resolve) => {
-      const child = spawnProcess(command, args, {
-        cwd: repoRoot,
-        windowsHide: true,
-        shell: false,
-        ...options,
-      });
-      let stdout = '';
-      let stderr = '';
-      child.stdout?.on('data', (data) => { stdout += data; });
-      child.stderr?.on('data', (data) => { stderr += data; });
-      child.on('close', (code) => resolve({ code: Number.isInteger(code) ? code : 1, stdout, stderr }));
-      child.on('error', (error) => resolve({ code: 1, stdout, stderr: error.message }));
+  async function run(command, args, options = {}) {
+    const result = await runner.run(command, args, {
+      cwd: repoRoot,
+      timeoutMs,
+      maxOutputBytes: 128 * 1024,
+      ...options,
     });
+    return {
+      ...result,
+      stderr: result.stderr || result.error || '',
+    };
   }
 
   function git(args, config = []) {
