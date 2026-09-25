@@ -5,10 +5,10 @@ import fsSync from 'node:fs';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { gzipSync } from 'node:zlib';
 import { networkInterfaces } from 'node:os';
 import { resolveInside } from './src/fs/path-security.mjs';
 import { createAtomicFileService } from './src/fs/atomic-files.mjs';
+import { createLilyMapSourceArchive } from './src/services/source-archive.mjs';
 import YAML from 'yaml';
 import { formatYamlValue, parseFrontMatter, patchFrontMatter } from './src/domain/front-matter.mjs';
 import { parseToml, patchMenus, patchTomlValue } from './src/domain/toml.mjs';
@@ -310,67 +310,6 @@ async function readProfile() {
     profile: { author: site.author || '', aboutTitle: site.aboutTitle || '', about: site.about || [], links: site.links || [] },
     version: createHash('sha256').update(raw).digest('hex'),
   };
-}
-
-async function lilymapSourceArchive() {
-  const sourceCandidates = [path.join(repoRoot, 'tools', 'admin'), adminDir];
-  const required = ['server.mjs', 'package.json', 'public/index.html', 'src/domain/value.mjs'];
-  let sourceRoot = '';
-  for (const candidate of sourceCandidates) {
-    if ((await Promise.all(required.map((name) => exists(path.join(candidate, ...name.split('/')))))).every(Boolean)) {
-      sourceRoot = candidate;
-      break;
-    }
-  }
-  if (!sourceRoot) throw new Error('当前 LilyMap 源码目录不完整，无法生成迁移包。');
-
-  const topFiles = new Set([
-    'server.mjs', 'package.json', 'package-lock.json', 'README.md', 'DESIGN.md',
-    'CONTRIBUTING.md', 'LICENSE', '.gitignore', 'lilymap.config.schema.json', 'lilymap.json.example',
-  ]);
-  const sourceDirectories = ['src', 'test', 'scripts', 'public', '.github'];
-  const names = [...topFiles].filter((name) => fsSync.existsSync(path.join(sourceRoot, name)));
-  for (const directory of sourceDirectories) {
-    const root = path.join(sourceRoot, directory);
-    if (!(await exists(root))) continue;
-    for (const file of await walk(root, () => true)) {
-      const relative = path.relative(sourceRoot, file).replaceAll('\\', '/');
-      if (!relative || relative.startsWith('../') || path.isAbsolute(relative)) throw new Error('源码导出路径越界。');
-      names.push(relative);
-    }
-  }
-  names.sort();
-  if (!names.length) throw new Error('没有找到可导出的 LilyMap 源码。');
-
-  const blocks = [];
-  let totalBytes = 0;
-  for (const name of names) {
-    const absolute = resolveInside(sourceRoot, name);
-    if (!absolute) throw new Error(`源码导出路径不安全：${name}`);
-    const stat = await fs.stat(absolute);
-    if (!stat.isFile() || stat.size > 8 * 1024 * 1024) throw new Error(`源码文件过大或类型无效：${name}`);
-    totalBytes += stat.size;
-    if (totalBytes > 48 * 1024 * 1024) throw new Error('LilyMap 源码总量超过 48 MB，已停止导出。');
-    const data = await fs.readFile(absolute);
-    const header = Buffer.alloc(512);
-    const entryName = `tools/admin/${name}`;
-    if (Buffer.byteLength(entryName, 'utf8') > 100) throw new Error(`源码路径过长，无法写入迁移包：${name}`);
-    header.write(entryName, 0, 100, 'utf8');
-    header.write('0000644\0', 100, 8, 'ascii');
-    header.write('0000000\0', 108, 8, 'ascii');
-    header.write('0000000\0', 116, 8, 'ascii');
-    header.write(data.length.toString(8).padStart(11, '0') + '\0', 124, 12, 'ascii');
-    header.write('00000000000\0', 136, 12, 'ascii');
-    header.fill(32, 148, 156);
-    header.write('0', 156, 1, 'ascii');
-    header.write('ustar\0', 257, 6, 'ascii');
-    header.write('00', 263, 2, 'ascii');
-    const sum = header.reduce((total, value) => total + value, 0);
-    header.write(sum.toString(8).padStart(6, '0') + '\0 ', 148, 8, 'ascii');
-    blocks.push(header, data, Buffer.alloc((512 - (data.length % 512)) % 512));
-  }
-  blocks.push(Buffer.alloc(1024));
-  return gzipSync(Buffer.concat(blocks));
 }
 
 function layoutRevisionRoot(name) { return path.join(trashRoot, 'layouts', name); }
@@ -1415,7 +1354,7 @@ async function handleApi(req, res, url) {
   }
   if (req.method === 'GET' && pathname === '/api/posts') return send(res, 200, { posts: await listPosts() });
   if (req.method === 'GET' && pathname === '/api/admin/export') {
-    const archive = await lilymapSourceArchive();
+    const archive = await createLilyMapSourceArchive({ repoRoot, adminDir });
     res.writeHead(200, { 'content-type': 'application/gzip', 'content-disposition': 'attachment; filename="lilymap-source.tar.gz"', 'content-length': archive.length, 'cache-control': 'no-store' });
     res.end(archive);
     return;
