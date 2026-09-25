@@ -16,6 +16,9 @@ test('Git failure details redact literal tokens and tokenized GitHub URLs', () =
   const detail = redactGitCredentials(`fatal: ${token}\nremote: https://oauth2:${token}@github.com/lily/site.git`, token);
   assert.doesNotMatch(detail, new RegExp(token));
   assert.match(detail, /https:\/\/\[REDACTED\]@github\.com/);
+  const proxy = redactGitCredentials('fatal: unable to access http://alice:swordfish@proxy.local:8080/repo');
+  assert.doesNotMatch(proxy, /alice|swordfish/);
+  assert.match(proxy, /http:\/\/\[REDACTED\]@proxy\.local:8080/);
 });
 
 test('publish safety rejects local secret and recovery paths', () => {
