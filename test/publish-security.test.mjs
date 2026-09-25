@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import { isSensitivePublishPath, redactGitCredentials, validatePublishToken } from '../src/domain/publish-security.mjs';
+import { isSensitivePublishPath, publishPushArguments, redactGitCredentials, validatePublishToken } from '../src/domain/publish-security.mjs';
 
 test('publish tokens are trimmed and constrained to the accepted format', () => {
   const token = 'ghp_123456789012345678901234567890';
@@ -25,4 +25,18 @@ test('publish safety rejects local secret and recovery paths', () => {
   for (const path of ['content/posts/hello/index.md', 'static/assets/img/avatar.webp', '.github/workflows/hugo.yaml']) {
     assert.equal(isSensitivePublishPath(path), false, path);
   }
+});
+
+
+test('force publishing uses a remote lease instead of an unconditional force refspec', () => {
+  const sha = 'a'.repeat(40);
+  assert.deepEqual(publishPushArguments('main'), ['push', 'github', 'HEAD:refs/heads/main']);
+  assert.deepEqual(publishPushArguments('main', { force: true, newRemoteBranch: true }), ['push', 'github', 'HEAD:refs/heads/main']);
+  assert.deepEqual(publishPushArguments('main', { force: true, remoteSha: sha }), [
+    'push',
+    `--force-with-lease=refs/heads/main:${sha}`,
+    'github',
+    'HEAD:refs/heads/main',
+  ]);
+  assert.throws(() => publishPushArguments('main', { force: true, remoteSha: 'bad' }), /远程基线/);
 });
