@@ -1,4 +1,4 @@
-import { api, trackedFetch, updateOperation } from './core/api.js';
+import { api, beginOperation, endOperation, trackedFetch, updateOperation } from './core/api.js';
 import { $, esc, toast } from './core/dom.js';
 import { allowedViews, state } from './core/state.js';
 import { decorateNavigation } from './core/icons.js';
