@@ -312,52 +312,48 @@ async function readProfile() {
 }
 
 async function lilymapSourceArchive() {
-  const names = [
-    'server.mjs',
-    'src/domain/value.mjs',
-    'src/domain/front-matter.mjs',
-    'src/domain/toml.mjs',
-    'src/domain/protected-content.mjs',
-    'src/domain/layout.mjs',
-    'src/domain/module-protocol.mjs',
-    'src/domain/profile.mjs',
-    'src/domain/publish-security.mjs',
-    'src/domain/theme-config.mjs',
-    'src/http/primitives.mjs',
-    'src/fs/path-security.mjs',
-    'test/domain.test.mjs',
-    'test/http.test.mjs',
-    'test/path-security.test.mjs',
-    'test/module-config-http.test.mjs',
-    'test/publish-security.test.mjs',
-    'test/publish-token-http.test.mjs',
-    'test/theme-module-rendering.test.mjs',
-    'package.json', 'package-lock.json', 'README.md', 'DESIGN.md', 'CONTRIBUTING.md', 'LICENSE', '.gitignore',
-    'lilymap.config.schema.json', 'lilymap.json.example',
-    'scripts/prepare-release.mjs', 'scripts/build-exe.mjs', 'scripts/check-protocol.mjs',
-    '.github/theme-compatibility.json', '.github/scripts/update-theme-compatibility.mjs',
-    '.github/workflows/validate.yml', '.github/workflows/release.yml', '.github/workflows/theme-compatibility-update.yml',
-    'public/index.html', 'public/css/app.css', 'public/css/base.css', 'public/css/refinements.css', 'public/css/workspace.css', 'public/js/app.js',
-    'public/js/core/api.js', 'public/js/core/dom.js', 'public/js/core/state.js', 'public/js/core/value.js',
-    'public/css/studio.css', 'public/js/core/icons.js', 'public/js/core/studio.js',
-    'public/css/modules.css', 'public/js/features/module-library.js', 'public/js/features/music-module.js', 'public/js/features/module-installer.js',
-    'src/domain/module-config.mjs', 'test/module-config.test.mjs',
-    'public/favicon.png', 'public/favicon.ico'
-  ];
   const sourceCandidates = [path.join(repoRoot, 'tools', 'admin'), adminDir];
+  const required = ['server.mjs', 'package.json', 'public/index.html', 'src/domain/value.mjs'];
   let sourceRoot = '';
   for (const candidate of sourceCandidates) {
-    if ((await Promise.all(names.map((name) => exists(path.join(candidate, ...name.split('/')))))).every(Boolean)) {
+    if ((await Promise.all(required.map((name) => exists(path.join(candidate, ...name.split('/')))))).every(Boolean)) {
       sourceRoot = candidate;
       break;
     }
   }
   if (!sourceRoot) throw new Error('当前 LilyMap 源码目录不完整，无法生成迁移包。');
+
+  const topFiles = new Set([
+    'server.mjs', 'package.json', 'package-lock.json', 'README.md', 'DESIGN.md',
+    'CONTRIBUTING.md', 'LICENSE', '.gitignore', 'lilymap.config.schema.json', 'lilymap.json.example',
+  ]);
+  const sourceDirectories = ['src', 'test', 'scripts', 'public', '.github'];
+  const names = [...topFiles].filter((name) => fsSync.existsSync(path.join(sourceRoot, name)));
+  for (const directory of sourceDirectories) {
+    const root = path.join(sourceRoot, directory);
+    if (!(await exists(root))) continue;
+    for (const file of await walk(root, () => true)) {
+      const relative = path.relative(sourceRoot, file).replaceAll('\\', '/');
+      if (!relative || relative.startsWith('../') || path.isAbsolute(relative)) throw new Error('源码导出路径越界。');
+      names.push(relative);
+    }
+  }
+  names.sort();
+  if (!names.length) throw new Error('没有找到可导出的 LilyMap 源码。');
+
   const blocks = [];
+  let totalBytes = 0;
   for (const name of names) {
-    const data = await fs.readFile(path.join(sourceRoot, ...name.split('/')));
+    const absolute = resolveInside(sourceRoot, name);
+    if (!absolute) throw new Error(`源码导出路径不安全：${name}`);
+    const stat = await fs.stat(absolute);
+    if (!stat.isFile() || stat.size > 8 * 1024 * 1024) throw new Error(`源码文件过大或类型无效：${name}`);
+    totalBytes += stat.size;
+    if (totalBytes > 48 * 1024 * 1024) throw new Error('LilyMap 源码总量超过 48 MB，已停止导出。');
+    const data = await fs.readFile(absolute);
     const header = Buffer.alloc(512);
     const entryName = `tools/admin/${name}`;
+    if (Buffer.byteLength(entryName, 'utf8') > 100) throw new Error(`源码路径过长，无法写入迁移包：${name}`);
     header.write(entryName, 0, 100, 'utf8');
     header.write('0000644\0', 100, 8, 'ascii');
     header.write('0000000\0', 108, 8, 'ascii');
