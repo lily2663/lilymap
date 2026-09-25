@@ -10,7 +10,7 @@
   "bin": "server.mjs",
   "scripts": {
     "start": "node server.mjs",
-    "check": "node scripts/check-js.mjs",
+    "check": "node scripts/check-js.mjs && node scripts/check-architecture.mjs",
     "protocol:check": "node scripts/check-protocol.mjs",
     "test": "node --test",
     "build": "esbuild server.mjs --bundle --platform=node --target=node22 --format=cjs --define:import.meta.url=undefined --outfile=server.cjs",

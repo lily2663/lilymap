@@ -12,19 +12,29 @@ import { createFileTransactionService } from './src/fs/file-transaction.mjs';
 import { createLilyMapSourceArchive } from './src/services/source-archive.mjs';
 import { createBuildService } from './src/services/build-service.mjs';
 import { createImportPlanner } from './src/services/import-planner.mjs';
+import { createImportService } from './src/services/import-service.mjs';
 import { createGitService } from './src/services/git-service.mjs';
 import { createPublishService } from './src/services/publish-service.mjs';
 import { createSiteSettingsService } from './src/services/site-settings-service.mjs';
+import { createMediaService, mediaKind as classifyMedia } from './src/services/media-service.mjs';
+import { createNetworkAdapter } from './src/services/network-adapter.mjs';
+import { createNeteaseService } from './src/services/netease-service.mjs';
+import { createLayoutModuleService } from './src/services/layout-module-service.mjs';
+import { createResourceService } from './src/services/resource-service.mjs';
 import { safeSlug } from './src/domain/slug.mjs';
 import YAML from 'yaml';
-import { formatYamlValue, parseFrontMatter, patchFrontMatter } from './src/domain/front-matter.mjs';
-import { parseToml } from './src/domain/toml.mjs';
+import { parseFrontMatter, patchFrontMatter } from './src/domain/front-matter.mjs';
 import { decryptProtectedBody, encryptProtectedBody } from './src/domain/protected-content.mjs';
 import { isObject, parseYaml } from './src/domain/value.mjs';
-import { normalizeLayout, normalizeModuleManifest, parseLayout, serializeLayout, validateLayoutAgainstRegistry } from './src/domain/layout.mjs';
 import { createHttpPrimitives } from './src/http/primitives.mjs';
 import { streamFile } from './src/http/static-files.mjs';
-import { updateModulePlacement } from './src/domain/module-config.mjs';
+import { createImportRoutes } from './src/http/routes/import-routes.mjs';
+import { createSettingsRoutes } from './src/http/routes/settings-routes.mjs';
+import { createMediaRoutes } from './src/http/routes/media-routes.mjs';
+import { createNeteaseRoutes } from './src/http/routes/netease-routes.mjs';
+import { createPublishRoutes } from './src/http/routes/publish-routes.mjs';
+import { createLayoutModuleRoutes } from './src/http/routes/layout-module-routes.mjs';
+import { createResourceRoutes } from './src/http/routes/resource-routes.mjs';
 
 // esbuild 打包成 cjs 后 __dirname 可用；dev 模式（node 直接跑 ESM）下 __dirname 不存在，
 // 用 import.meta.url 兜底推导。
@@ -137,6 +147,7 @@ const mediaTargetNames = new Map([
   ['welcome', 'day'],
   ['night', 'night'],
 ]);
+const mediaKind = (target) => classifyMedia(target, uploadImageExtensions, uploadVideoExtensions);
 
 // 管理端的状态必须反映真实进程，而不是根据“服务启动过”猜测。状态对象只
 // 保存低敏感、有限长度的诊断信息，供概览页和版本页展示。
@@ -146,23 +157,6 @@ const previewState = {
   startedAt: null,
   stoppedAt: null,
 };
-let publishState = null;
-
-function publishSnapshot() {
-  if (!publishState) return null;
-  return {
-    id: publishState.id,
-    status: publishState.status,
-    progress: publishState.progress,
-    stage: publishState.stage,
-    message: publishState.message,
-    error: publishState.error,
-    force: publishState.force,
-    startedAt: publishState.startedAt,
-    finishedAt: publishState.finishedAt,
-  };
-}
-
 function lanPreviewAddresses() {
   const virtual = /radmin|vethernet|virtual|vmware|loopback|tailscale/i;
   const candidates = [];
@@ -207,54 +201,7 @@ function repoPath(relative, allowedRoots = [contentRoot]) {
   return null;
 }
 
-function managedResourcePath(relative) {
-  const target = repoPath(relative, [siteAssetsRoot, path.join(contentRoot, 'posts')]);
-  if (!target || !['image', 'video'].includes(mediaKind(target))) return null;
-  if (target.startsWith(`${path.join(contentRoot, 'posts')}${path.sep}`)) {
-    const parts = path.relative(path.join(contentRoot, 'posts'), target).split(path.sep);
-    if (parts.length !== 2 || !uploadImageExtensions.has(path.extname(target).toLowerCase())) return null;
-  }
-  return target;
-}
-
 function relativeToRepo(target) { return path.relative(repoRoot, target).split(path.sep).join('/'); }
-
-function publicPathForRepoFile(target) {
-  const resolved = path.resolve(target);
-  if (resolved === staticRoot || resolved.startsWith(`${staticRoot}${path.sep}`)) {
-    const relative = path.relative(staticRoot, resolved).split(path.sep).join('/');
-    return relative ? `/${relative}` : '/';
-  }
-  return null;
-}
-
-function canonicalAssetDirectory(rawArea = 'static/assets/img') {
-  let normalized = String(rawArea || '').trim().replaceAll('\\', '/').replace(/^\/+|\/+$/g, '');
-  // 旧版 LilyMap 曾把 assets/ 当成可直接访问目录；继续接受旧输入，
-  // 但统一重定向到 Hugo 真正公开的 static/assets/，杜绝“配置有 URL、线上无文件”。
-  normalized = normalized.replace(/^static\//, '');
-  if (normalized === 'assets') normalized = 'assets/img';
-  if (!normalized.startsWith('assets/')) return null;
-  const parts = normalized.split('/').filter(Boolean);
-  if (parts.some((part) => part === '.' || part === '..' || !/^[\p{L}\p{N}._-]+$/u.test(part))) return null;
-  return inside(staticRoot, parts.join(path.sep));
-}
-
-function mediaKind(target) {
-  const extension = path.extname(String(target || '')).toLowerCase();
-  if (uploadImageExtensions.has(extension)) return 'image';
-  if (uploadVideoExtensions.has(extension)) return 'video';
-  return 'other';
-}
-
-function safeMediaStem(value, fallback = 'media') {
-  const stem = path.parse(path.basename(String(value || ''))).name
-    .normalize('NFKC')
-    .replace(/[^\p{L}\p{N}._-]+/gu, '-')
-    .replace(/^-+|-+$/g, '')
-    .slice(0, 72);
-  return stem || fallback;
-}
 
 async function exists(target) { try { await fs.access(target); return true; } catch { return false; } }
 
@@ -282,503 +229,9 @@ async function walk(root, predicate = () => true) {
   return entries;
 }
 
-function layoutRevisionRoot(name) { return path.join(trashRoot, 'layouts', name); }
-
-async function snapshotLayout(name, target) {
-  if (!(await exists(target))) return null;
-  const stamp = new Date().toISOString().replace(/[:.]/g, '-');
-  const destination = path.join(layoutRevisionRoot(name), `${stamp}.yaml`);
-  await fs.mkdir(path.dirname(destination), { recursive: true });
-  await fs.copyFile(target, destination);
-  return relativeToRepo(destination);
-}
-
-async function layoutHistory(name) {
-  if (!/^[\w-]+$/.test(name)) throw new Error('布局名称不合法。');
-  const root = layoutRevisionRoot(name);
-  if (!(await exists(root))) return [];
-  const files = (await fs.readdir(root, { withFileTypes: true }))
-    .filter((entry) => entry.isFile() && /^\d{4}-\d{2}-\d{2}T[\d-]+Z\.yaml$/.test(entry.name))
-    .map((entry) => entry.name)
-    .sort()
-    .reverse();
-  return Promise.all(files.map(async (file) => {
-    const target = path.join(root, file);
-    const stat = await fs.stat(target);
-    return { revision: file, savedAt: stat.mtime.toISOString(), path: relativeToRepo(target) };
-  }));
-}
-
-async function yamlFiles(root) { return (await exists(root)) ? (await fs.readdir(root)).filter((name) => name.endsWith('.yaml')).sort().map((name) => path.join(root, name)) : []; }
-
-async function loadModuleRegistry() {
-  const modules = {};
-  for (const [root, source] of [[builtInModulesRoot, 'built-in'], [userModulesRoot, 'site']]) {
-    for (const file of await yamlFiles(root)) { const id = path.basename(file, '.yaml'); modules[id] = normalizeModuleManifest(id, await fs.readFile(file, 'utf8'), source); }
-  }
-  if (modules.welcome) {
-    const values = parseToml(await fs.readFile(path.join(repoRoot, 'hugo.toml'), 'utf8')).values;
-    modules.welcome.siteDefaults = {};
-    for (const key of Object.keys(modules.welcome.schema)) {
-      const setting = Object.keys(values).find((name) => name.toLowerCase() === `params.welcome.${key}`.toLowerCase());
-      if (setting) modules.welcome.siteDefaults[key] = values[setting];
-    }
-  }
-  return modules;
-}
-
-async function loadLayoutEditor() {
-  const layouts = new Map();
-  for (const [root, source] of [[builtInLayoutsRoot, 'built-in'], [userLayoutsRoot, 'site']]) {
-    for (const file of await yamlFiles(root)) { const name = path.basename(file, '.yaml'); const raw = await fs.readFile(file, 'utf8'); layouts.set(name, { name, parsed: parseLayout(raw, `布局 ${name}`), raw, source }); }
-  }
-  return { layouts: [...layouts.values()].sort((a, b) => a.name.localeCompare(b.name)), modules: await loadModuleRegistry() };
-}
-
-function siteModulePaths(id, manifest) {
-  const relative = [
-    `data/lily/modules/${id}.yaml`,
-    manifest.template?.partial ? `layouts/partials/${manifest.template.partial}` : `layouts/partials/lily/modules/${id}/render.html`,
-    ...(manifest.assets?.styles || []).map((file) => `assets/${file}`),
-    ...(manifest.assets?.scripts || []).map((file) => `assets/${file}`),
-  ];
-  return [...new Set(relative.map((file) => repoPath(file, [repoRoot])).filter(Boolean))];
-}
-
-async function moduleUsage() {
-  const { layouts, modules } = await loadLayoutEditor();
-  const usage = {};
-  for (const layout of layouts) {
-    for (const [slot, instances] of Object.entries(layout.parsed.slots)) {
-      for (const instance of instances) (usage[instance.module] ||= []).push({ layout: layout.name, slot, instance: instance.id });
-    }
-  }
-  return { modules, layouts, usage };
-}
-
-async function installSiteModule(request) {
-  if (typeof request.manifest !== 'string' || request.manifest.length > maxBodyBytes) throw new Error('模块 manifest 无效。');
-  const rawManifest = request.manifest.replace(/^\uFEFF/, '');
-  const preview = parseYaml(rawManifest, '模块 manifest');
-  const id = String(preview.id || '').trim();
-  const manifest = normalizeModuleManifest(id, rawManifest, 'site');
-  if (manifest.template.partial !== `lily/modules/${id}/render.html`) throw new Error('本地模块模板必须位于 lily/modules/<id>/render.html。');
-  if (typeof request.template !== 'string' || !request.template.trim() || request.template.length > maxBodyBytes) throw new Error('模块必须提供 render.html 模板。');
-  const registry = await loadModuleRegistry();
-  if (registry[id] && registry[id].source === 'built-in') throw new Error('不能覆盖内置模块；请使用新的模块 id。');
-  if (registry[id] && request.replace !== true) throw new Error('该本地模块已存在；确认更新后再覆盖。');
-  const stylePath = `lily/modules/${id}.css`; const scriptPath = `lily/modules/${id}.js`;
-  for (const file of manifest.assets.styles || []) if (file !== stylePath) throw new Error(`CSS 必须命名为 ${stylePath}。`);
-  for (const file of manifest.assets.scripts || []) if (file !== scriptPath) throw new Error(`JS 必须命名为 ${scriptPath}。`);
-  if ((manifest.assets.styles || []).includes(stylePath) && typeof request.style !== 'string') throw new Error('manifest 声明了 CSS，但未提供样式内容。');
-  if ((manifest.assets.scripts || []).includes(scriptPath) && typeof request.script !== 'string') throw new Error('manifest 声明了 JS，但未提供脚本内容。');
-  const files = [
-    { target: path.join(userModulesRoot, `${id}.yaml`), content: rawManifest },
-    { target: path.join(repoRoot, 'layouts', 'partials', manifest.template.partial), content: request.template },
-  ];
-  if ((manifest.assets.styles || []).includes(stylePath)) files.push({ target: path.join(repoRoot, 'assets', stylePath), content: request.style });
-  if ((manifest.assets.scripts || []).includes(scriptPath)) files.push({ target: path.join(repoRoot, 'assets', scriptPath), content: request.script });
-  await fileTransaction.replaceFiles(files);
-  return { id, manifest };
-}
-
-async function readResponseTextLimited(response, limit) {
-  const declared = Number(response.headers.get('content-length') || 0);
-  if (Number.isFinite(declared) && declared > limit) throw new Error('远程服务返回内容过大，已停止读取。');
-  if (!response.body) return '';
-  const chunks = [];
-  let size = 0;
-  for await (const chunk of response.body) {
-    const bytes = Buffer.from(chunk);
-    size += bytes.length;
-    if (size > limit) throw new Error('远程服务返回内容过大，已停止读取。');
-    chunks.push(bytes);
-  }
-  return Buffer.concat(chunks).toString('utf8');
-}
-
-async function importNeteasePlaylist(request) {
-  const playlistInput = String(request?.playlistId || '').trim();
-  let playlistId = playlistInput;
-  if (/^https?:\/\//i.test(playlistInput)) {
-    let parsed;
-    try { parsed = new URL(playlistInput); } catch { throw new Error('歌单链接格式无效。'); }
-    if (!['music.163.com', 'y.music.163.com'].includes(parsed.hostname.toLowerCase())) throw new Error('只支持网易云音乐歌单链接。');
-    playlistId = parsed.searchParams.get('id') || parsed.hash.match(/[?&]id=(\d+)/)?.[1] || '';
-  }
-  if (!/^\d{5,20}$/.test(playlistId)) throw new Error('请输入正确的网易云歌单 ID。');
-  const cookie = String(request?.cookie || '').trim().replace(/^cookie\s*:\s*/i, '').replace(/\\([_*])/g, '$1');
-  if (cookie.length > 8192 || /[\r\n\0]/.test(cookie)) throw new Error('Cookie 格式无效。');
-
-  let response;
-  try {
-    response = await fetch(`https://music.163.com/api/v6/playlist/detail?id=${encodeURIComponent(playlistId)}&n=1000&s=0`, {
-      headers: {
-        accept: 'application/json, text/plain, */*',
-        cookie,
-        referer: `https://music.163.com/playlist?id=${encodeURIComponent(playlistId)}`,
-        'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 LilyMap/1.0',
-      },
-      redirect: 'manual',
-      signal: AbortSignal.timeout(20000),
-    });
-  } catch {
-    throw new Error('连接网易云超时，请检查网络后重试。');
-  }
-  if (response.status >= 300 && response.status < 400) throw new Error('网易云接口返回了重定向；为避免登录 Cookie 被转发到其他地址，已停止导入。');
-  if (!response.ok) throw new Error(`网易云返回 HTTP ${response.status}，请稍后重试。`);
-
-  let payload;
-  try { payload = JSON.parse(await readResponseTextLimited(response, 8 * 1024 * 1024)); }
-  catch (error) {
-    if (/内容过大/.test(error.message)) throw error;
-    throw new Error('网易云返回了无法识别的数据。');
-  }
-  const playlist = payload?.playlist || payload?.result;
-  if (!playlist || !Array.isArray(playlist.tracks)) {
-    if (payload?.code === 401 || payload?.code === 20001) {
-      throw new Error(cookie
-        ? '网易云拒绝访问这个隐私歌单。当前 Cookie 未获得访问权限或已经过期，请在网易云重新登录后复制完整 Cookie。原有歌单快照不会被覆盖。'
-        : '这是隐私歌单。请填写有访问权限且仍有效的网易云登录 Cookie，或把歌单设为公开。原有歌单快照仍可使用。');
-    }
-    throw new Error(String(payload?.message || payload?.msg || '没有读取到歌单；请检查歌单 ID 与 Cookie。').slice(0, 180));
-  }
-
-  const tracks = playlist.tracks.slice(0, 500).map((track) => {
-    const id = String(track?.id || '').trim();
-    const artists = track?.ar || track?.artists || [];
-    const album = track?.al || track?.album || {};
-    return {
-      id,
-      title: String(track?.name || '未命名音乐').slice(0, 160),
-      artist: artists.map((artist) => String(artist?.name || '')).filter(Boolean).join(' / ').slice(0, 200),
-      album: String(album?.name || '').slice(0, 160),
-      cover: String(album?.picUrl || '').replace(/^http:/i, 'https:').slice(0, 1000),
-      duration: Number(track?.dt || track?.duration || 0),
-      source: `https://music.163.com/song/media/outer/url?id=${encodeURIComponent(id)}.mp3`,
-    };
-  }).filter((track) => /^\d{1,20}$/.test(track.id));
-  if (!tracks.length) throw new Error('歌单中没有可导入的歌曲。');
-
-  const snapshot = {
-    provider: 'netease',
-    playlistId,
-    name: String(playlist.name || `网易云歌单 ${playlistId}`).slice(0, 160),
-    cover: String(playlist.coverImgUrl || '').replace(/^http:/i, 'https:').slice(0, 1000),
-    importedAt: new Date().toISOString(),
-    tracks,
-  };
-  const target = inside(path.join(repoRoot, 'data', 'lily', 'music'), `p${playlistId}.yaml`);
-  if (!target) throw new Error('歌单保存路径无效。');
-  if (await exists(target)) {
-    const previous = parseYaml(await fs.readFile(target, 'utf8'), `歌单 ${playlistId}`);
-    const availableIds = new Set(tracks.map((track) => track.id));
-    snapshot.excludedTrackIds = Array.isArray(previous.excludedTrackIds)
-      ? previous.excludedTrackIds.map(String).filter((id) => availableIds.has(id))
-      : [];
-  }
-  await atomicWrite(target, YAML.stringify(snapshot), { schedule: false });
-  const activated = request?.activate === true;
-  if (activated) await activateNeteasePlaylist(playlistId, { build: false });
-  const build = await runBuild(false, 'netease-playlist');
-  if (build.code !== 0) throw new Error(`歌单已保存${activated ? '并设为当前歌单' : ''}，但博客构建失败：${build.output || '请查看系统诊断。'}`);
-  return { playlistId, name: snapshot.name, trackCount: tracks.length, path: relativeToRepo(target), activated, build: build.build };
-}
-
-async function activeNeteasePlaylistId() {
-  const target = path.join(userLayoutsRoot, 'home.yaml');
-  const source = await exists(target) ? target : path.join(builtInLayoutsRoot, 'home.yaml');
-  if (!(await exists(source))) return '';
-  const layout = parseLayout(await fs.readFile(source, 'utf8'), '首页布局');
-  for (const instances of Object.values(layout.slots)) {
-    const music = instances.find((instance) => instance.module === 'music' && instance.enabled !== false);
-    if (music) return String(music.config?.playlistId || '');
-  }
-  return '';
-}
-
-async function activateNeteasePlaylist(rawPlaylistId, { build = true } = {}) {
-  const playlistId = String(rawPlaylistId || '').trim();
-  if (!/^\d{5,20}$/.test(playlistId)) throw new Error('请输入正确的网易云歌单 ID。');
-  const snapshot = inside(path.join(repoRoot, 'data', 'lily', 'music'), `p${playlistId}.yaml`);
-  if (!snapshot || !(await exists(snapshot))) throw new Error('该歌单尚未导入，请先同步歌单。');
-  const target = path.join(userLayoutsRoot, 'home.yaml');
-  const source = await exists(target) ? target : path.join(builtInLayoutsRoot, 'home.yaml');
-  if (!(await exists(source))) throw new Error('未找到首页布局，请先在页面布局中添加 Lily Radio。');
-  const document = YAML.parseDocument(await fs.readFile(source, 'utf8'), { prettyErrors: true, uniqueKeys: true });
-  if (document.errors.length) throw new Error(`首页布局 YAML 无效：${document.errors[0].message}`);
-  const layout = normalizeLayout(document.toJS({ mapAsMap: false }), '首页布局');
-  const instances = Object.entries(layout.slots).flatMap(([slot, items]) => items.map((item, index) => ({ slot, item, index })));
-  const music = instances.filter(({ item }) => item.module === 'music' && item.enabled !== false);
-  if (!music.length) throw new Error('首页没有启用的 Lily Radio；请先在页面布局中添加模块。');
-  const previousPlaylistId = String(music[0].item.config?.playlistId || '');
-  for (const { slot, index } of music) document.setIn(['slots', slot, index, 'config', 'playlistId'], playlistId);
-  const updated = parseLayout(String(document), '首页布局');
-  validateLayoutAgainstRegistry(updated, await loadModuleRegistry());
-  if (await exists(target)) await snapshotLayout('home', target);
-  await atomicWrite(target, String(document), { schedule: false });
-  if (build) {
-    const result = await runBuild(false, 'netease-activate');
-    if (result.code !== 0) throw new Error(`歌单已设为当前歌单，但博客构建失败：${result.output || '请查看系统诊断。'}`);
-  }
-  return { playlistId, previousPlaylistId, active: true };
-}
-
-async function neteaseSnapshotStatus(rawPlaylistId) {
-  const playlistId = String(rawPlaylistId || '').trim();
-  if (!/^\d{5,20}$/.test(playlistId)) throw new Error('请输入正确的网易云歌单 ID。');
-  const activePlaylistId = await activeNeteasePlaylistId();
-  const target = inside(path.join(repoRoot, 'data', 'lily', 'music'), `p${playlistId}.yaml`);
-  if (!target || !(await exists(target))) return { exists: false, playlistId, trackCount: 0, activePlaylistId, active: playlistId === activePlaylistId };
-  const snapshot = parseYaml(await fs.readFile(target, 'utf8'), `歌单 ${playlistId}`);
-  const stat = await fs.stat(target);
-  const trackCount = Array.isArray(snapshot.tracks) ? snapshot.tracks.length : 0;
-  const excludedCount = Array.isArray(snapshot.excludedTrackIds) ? snapshot.excludedTrackIds.length : 0;
-  return {
-    exists: true,
-    playlistId,
-    activePlaylistId,
-    active: playlistId === activePlaylistId,
-    name: String(snapshot.name || `网易云歌单 ${playlistId}`).slice(0, 160),
-    trackCount,
-    excludedCount,
-    playableCount: Math.max(0, trackCount - excludedCount),
-    importedAt: snapshot.importedAt || stat.mtime.toISOString(),
-    path: relativeToRepo(target),
-  };
-}
-
-async function neteaseSnapshotTracks(rawPlaylistId) {
-  const playlistId = String(rawPlaylistId || '').trim();
-  if (!/^\d{5,20}$/.test(playlistId)) throw new Error('请输入正确的网易云歌单 ID。');
-  const target = inside(path.join(repoRoot, 'data', 'lily', 'music'), `p${playlistId}.yaml`);
-  if (!target || !(await exists(target))) throw new Error('该歌单尚未导入。');
-  const snapshot = parseYaml(await fs.readFile(target, 'utf8'), `歌单 ${playlistId}`);
-  if (!Array.isArray(snapshot.tracks)) throw new Error('歌单快照缺少歌曲列表。');
-  const excludedTrackIds = Array.isArray(snapshot.excludedTrackIds) ? snapshot.excludedTrackIds.map(String) : [];
-  return {
-    playlistId,
-    name: String(snapshot.name || `网易云歌单 ${playlistId}`),
-    tracks: snapshot.tracks.map((track) => ({ id: String(track.id), title: String(track.title || ''), artist: String(track.artist || '') })),
-    excludedTrackIds,
-  };
-}
-
-async function checkNeteaseTrackAvailability(request) {
-  const snapshot = await neteaseSnapshotTracks(request?.playlistId);
-  const trackIds = request?.trackIds;
-  if (!Array.isArray(trackIds) || trackIds.length < 1 || trackIds.length > 8) throw new Error('每次只能检测 1–8 首歌曲。');
-  const known = new Set(snapshot.tracks.map((track) => track.id));
-  if (!trackIds.every((id) => typeof id === 'string' && known.has(id))) throw new Error('检测列表包含不属于该歌单的歌曲。');
-  const results = await Promise.all(trackIds.map(async (id) => {
-    try {
-      const response = await fetch(`https://music.163.com/song/media/outer/url?id=${encodeURIComponent(id)}.mp3`, {
-        method: 'HEAD',
-        redirect: 'follow',
-        signal: AbortSignal.timeout(10000),
-      });
-      const type = String(response.headers.get('content-type') || '').toLowerCase();
-      const state = response.ok && type.startsWith('audio/') ? 'playable'
-        : response.url.includes('/404') || type.includes('text/html') || response.status === 404 ? 'unavailable'
-          : 'unknown';
-      return { id, state };
-    } catch { return { id, state: 'unknown' }; }
-  }));
-  return { playlistId: snapshot.playlistId, results };
-}
-
-async function saveNeteaseExclusions(request) {
-  const snapshot = await neteaseSnapshotTracks(request?.playlistId);
-  const ids = request?.excludedTrackIds;
-  if (!Array.isArray(ids) || ids.length > 500 || !ids.every((id) => typeof id === 'string')) throw new Error('剔除列表格式无效。');
-  const known = new Set(snapshot.tracks.map((track) => track.id));
-  const excludedTrackIds = [...new Set(ids)];
-  if (!excludedTrackIds.every((id) => known.has(id))) throw new Error('剔除列表包含不属于该歌单的歌曲。');
-  if (excludedTrackIds.length >= snapshot.tracks.length) throw new Error('请至少保留一首歌曲供博客播放。');
-  const target = inside(path.join(repoRoot, 'data', 'lily', 'music'), `p${snapshot.playlistId}.yaml`);
-  const document = YAML.parseDocument(await fs.readFile(target, 'utf8'), { prettyErrors: true, uniqueKeys: true });
-  if (document.errors.length) throw new Error(`歌单 YAML 无效：${document.errors[0].message}`);
-  document.set('excludedTrackIds', excludedTrackIds);
-  await atomicWrite(target, String(document), { schedule: false });
-  const build = await runBuild(false, 'netease-exclusions');
-  if (build.code !== 0) throw new Error(`剔除设置已保存，但博客构建失败：${build.output || '请查看系统诊断。'}`);
-  return { playlistId: snapshot.playlistId, total: snapshot.tracks.length, excludedCount: excludedTrackIds.length, playableCount: snapshot.tracks.length - excludedTrackIds.length };
-}
-
-async function listNeteaseSnapshots() {
-  const root = path.join(repoRoot, 'data', 'lily', 'music');
-  const activePlaylistId = await activeNeteasePlaylistId();
-  const files = (await yamlFiles(root)).filter((file) => /^p\d{5,20}\.yaml$/.test(path.basename(file)));
-  const playlists = await Promise.all(files.map(async (file) => {
-    const playlistId = path.basename(file).slice(1, -5);
-    return neteaseSnapshotStatus(playlistId);
-  }));
-  playlists.sort((a, b) => String(b.importedAt || '').localeCompare(String(a.importedAt || '')));
-  return { activePlaylistId, playlists };
-}
-
-async function uninstallSiteModule(id) {
-  const registry = await loadModuleRegistry(); const manifest = registry[id];
-  if (!manifest) throw new Error('模块不存在。');
-  if (manifest.source !== 'site') throw new Error('内置模块不能卸载；可以从布局中移除。');
-  const { usage } = await moduleUsage();
-  if (usage[id]?.length) throw new Error(`模块仍被 ${usage[id].map((item) => `${item.layout}.${item.slot}`).join('、')} 使用，请先从布局移除。`);
-  const stamp = new Date().toISOString().replace(/[:.]/g, '-');
-  const destinationRoot = path.join(trashRoot, 'modules', `${stamp}-${id}`);
-  for (const source of siteModulePaths(id, manifest)) {
-    if (!(await exists(source))) continue;
-    const destination = inside(destinationRoot, relativeToRepo(source));
-    if (!destination) throw new Error('模块回收路径无效。');
-    await fs.mkdir(path.dirname(destination), { recursive: true });
-    await fs.rename(source, destination);
-  }
-  scheduleBuild();
-  return { id, trashedTo: relativeToRepo(destinationRoot) };
-}
-
 function versionFor(raw, stat) { return `${stat.size}:${createHash('sha256').update(raw).digest('hex').slice(0, 16)}`; }
 
 const { git, gitNetwork, systemGitProxy, safeGitFailure, gitChanges } = createGitService({ repoRoot });
-
-function runLocalCommand(command, args) {
-  return new Promise((resolve) => {
-    const child = spawn(command, args, { cwd: repoRoot, windowsHide: true, shell: false });
-    let stdout = ''; let stderr = '';
-    child.stdout.on('data', (data) => { stdout += data; });
-    child.stderr.on('data', (data) => { stderr += data; });
-    child.on('close', (code) => resolve({ code, stdout, stderr }));
-    child.on('error', (error) => resolve({ code: 1, stdout, stderr: error.message }));
-  });
-}
-
-const ffmpegCommand = process.env.FFMPEG_PATH || 'ffmpeg';
-const ffprobeCommand = process.env.FFPROBE_PATH || 'ffprobe';
-let mediaToolsPromise;
-
-async function mediaToolsStatus() {
-  if (!mediaToolsPromise) {
-    mediaToolsPromise = Promise.all([
-      runLocalCommand(ffmpegCommand, ['-version']),
-      runLocalCommand(ffprobeCommand, ['-version']),
-    ]).then(([ffmpeg, ffprobe]) => ({
-      available: ffmpeg.code === 0 && ffprobe.code === 0,
-      ffmpeg: ffmpeg.code === 0,
-      ffprobe: ffprobe.code === 0,
-      version: (ffmpeg.stdout.match(/^ffmpeg version\s+([^\s]+)/m)?.[1] || '').slice(0, 80),
-    }));
-  }
-  return mediaToolsPromise;
-}
-
-async function inspectMedia(source) {
-  const result = await runLocalCommand(ffprobeCommand, [
-    '-v', 'error', '-select_streams', 'v:0',
-    '-show_entries', 'stream=codec_name,width,height,avg_frame_rate:format=duration,size,format_name',
-    '-of', 'json', source,
-  ]);
-  if (result.code !== 0) throw httpError(400, '无法读取媒体文件：文件可能损坏，或不是受支持的视频格式。');
-  try {
-    const parsed = JSON.parse(result.stdout);
-    const stream = parsed.streams?.[0];
-    if (!stream?.width || !stream?.height) throw new Error('missing video stream');
-    return {
-      codec: stream.codec_name || '',
-      width: Number(stream.width) || 0,
-      height: Number(stream.height) || 0,
-      frameRate: stream.avg_frame_rate || '',
-      duration: Number(parsed.format?.duration) || 0,
-      size: Number(parsed.format?.size) || 0,
-      format: parsed.format?.format_name || '',
-    };
-  } catch {
-    throw httpError(400, '媒体探测结果无效，无法安全导入。');
-  }
-}
-
-async function syncStaticPreview(sourcePath) {
-  const publicPath = publicPathForRepoFile(sourcePath);
-  if (!publicPath) return { previewSynced: false, warning: '资源不在 static 目录，无法生成公开路径。' };
-  const destination = inside(hugoPublicRoot, publicPath.slice(1).split('/').join(path.sep));
-  if (!destination) return { previewSynced: false, warning: '预览目标路径不安全。' };
-  try {
-    await fs.mkdir(path.dirname(destination), { recursive: true });
-    await fs.copyFile(sourcePath, destination);
-    return { previewSynced: true, warning: '' };
-  } catch (error) {
-    scheduleBuild();
-    return { previewSynced: false, warning: error.message || '本地预览同步失败，已安排 Hugo 重建。' };
-  }
-}
-
-async function importWallpaperMedia(sourcePath, targetName) {
-  const targetPrefix = mediaTargetNames.get(String(targetName || ''));
-  if (!targetPrefix) throw httpError(400, '壁纸目标只能是日间或夜间。');
-  if (!path.isAbsolute(sourcePath)) throw httpError(400, '请输入完整的本机绝对路径。');
-  const source = path.resolve(sourcePath);
-  let stat;
-  try { stat = await fs.stat(source); } catch { throw httpError(404, '没有找到这个本机文件，请检查盘符和路径。'); }
-  if (!stat.isFile()) throw httpError(400, '该路径不是文件。');
-  if (stat.size > 1024 * 1024 * 1024) throw httpError(413, '媒体文件超过 1 GB，不适合作为网页壁纸。');
-  const extension = path.extname(source).toLowerCase();
-  const kind = mediaKind(source);
-  if (!['image', 'video'].includes(kind)) throw httpError(400, '支持 PNG、JPG、WebP、GIF、AVIF、MP4、WebM、MOV、M4V、MKV、AVI。');
-  if (kind === 'image' && stat.size > 64 * 1024 * 1024) throw httpError(413, '图片文件超过 64 MB，已拒绝整文件载入；请先压缩后再导入。');
-  const directory = path.join(siteAssetsRoot, kind === 'video' ? 'media' : 'img', 'wallpapers');
-  await fs.mkdir(directory, { recursive: true });
-  const stamp = `${Date.now()}-${randomUUID().slice(0, 8)}`;
-  if (kind === 'image') {
-    const bytes = await fs.readFile(source);
-    if (!hasExpectedImageSignature(bytes, extension)) throw httpError(400, '图片内容与扩展名不匹配或文件已损坏。');
-    const destination = path.join(directory, `${targetPrefix}-wallpaper-${stamp}${extension}`);
-    await atomicCreate(destination, bytes);
-    const preview = await syncStaticPreview(destination);
-    return {
-      ok: true, kind, path: publicPathForRepoFile(destination), file: relativeToRepo(destination),
-      sourceSize: stat.size, outputSize: stat.size, optimized: false, ...preview,
-    };
-  }
-
-  const tools = await mediaToolsStatus();
-  if (!tools.available) throw httpError(503, '没有找到 FFmpeg/FFprobe，暂时无法安全转换视频壁纸。');
-  const input = await inspectMedia(source);
-  const destination = path.join(directory, `${targetPrefix}-wallpaper-${stamp}.mp4`);
-  const temporary = `${destination}.${randomUUID()}.tmp.mp4`;
-  const result = await runLocalCommand(ffmpegCommand, [
-    '-hide_banner', '-loglevel', 'error', '-i', source,
-    '-map', '0:v:0', '-vf', 'scale=w=min(1920\\,iw):h=-2:flags=lanczos,fps=30',
-    '-an', '-c:v', 'libx264', '-preset', 'medium', '-crf', '24',
-    '-pix_fmt', 'yuv420p', '-movflags', '+faststart', '-map_metadata', '-1',
-    '-y', temporary,
-  ]);
-  if (result.code !== 0) {
-    await fs.rm(temporary, { force: true }).catch(() => {});
-    throw httpError(400, `视频转换失败：${String(result.stderr || result.stdout || '未知错误').trim().slice(-500)}`);
-  }
-  await fs.rename(temporary, destination);
-  const outputStat = await fs.stat(destination);
-  const output = await inspectMedia(destination);
-  const preview = await syncStaticPreview(destination);
-  const posterPath = destination.replace(/\.mp4$/i, '.poster.webp');
-  const temporaryPoster = `${posterPath}.${randomUUID()}.tmp.webp`;
-  let poster = null;
-  const posterResult = await runLocalCommand(ffmpegCommand, [
-    '-hide_banner', '-loglevel', 'error', '-ss', '0.2', '-i', destination,
-    '-frames:v', '1', '-vf', 'scale=w=min(1920\\,iw):h=-2:flags=lanczos',
-    '-c:v', 'libwebp', '-quality', '78', '-compression_level', '4', '-y', temporaryPoster,
-  ]);
-  if (posterResult.code === 0) {
-    await fs.rename(temporaryPoster, posterPath);
-    const posterStat = await fs.stat(posterPath);
-    const posterPreview = await syncStaticPreview(posterPath);
-    poster = { path: publicPathForRepoFile(posterPath), file: relativeToRepo(posterPath), size: posterStat.size, ...posterPreview };
-  } else {
-    await fs.rm(temporaryPoster, { force: true }).catch(() => {});
-  }
-  return {
-    ok: true, kind, path: publicPathForRepoFile(destination), file: relativeToRepo(destination),
-    sourceSize: stat.size, outputSize: outputStat.size, optimized: true, input, output, poster, ...preview,
-  };
-}
 
 // 博客预览由 admin server 自己托管 public/（见底部 blogServer），
 // 不再探测外部 hugo server，因此恒为运行中。
@@ -880,10 +333,86 @@ const { stageFile, atomicWrite, atomicCreate, copyWithoutClobber } = createAtomi
   relativeToRepo,
 });
 
+const importService = createImportService({
+  repoRoot,
+  contentRoot,
+  trashRoot,
+  uploadImageExtensions,
+  prepareImport,
+  hasExpectedImageSignature,
+  atomicWrite,
+  atomicCreate,
+  copyWithoutClobber,
+  scheduleBuild,
+  httpError,
+});
+
+const mediaService = createMediaService({
+  repoRoot,
+  siteAssetsRoot,
+  hugoPublicRoot,
+  uploadImageExtensions,
+  uploadVideoExtensions,
+  mediaTargetNames,
+  hasExpectedImageSignature,
+  httpError,
+  atomicCreate,
+  scheduleBuild,
+});
+const {
+  mediaToolsStatus,
+  inspectMedia,
+  syncStaticPreview,
+  importWallpaperMedia,
+  importUploadedVideo,
+} = mediaService;
+
+const resourceService = createResourceService({
+  repoRoot,
+  contentRoot,
+  staticRoot,
+  siteAssetsRoot,
+  trashRoot,
+  uploadImageExtensions,
+  mediaKind,
+  hasExpectedImageSignature,
+  atomicCreate,
+  atomicWrite,
+  scheduleBuild,
+  syncStaticPreview,
+  inspectMedia,
+});
+
+const network = createNetworkAdapter();
+
 const fileTransaction = createFileTransactionService({
   stageFile,
   atomicWrite,
   scheduleBuild,
+});
+
+const layoutModules = createLayoutModuleService({
+  repoRoot,
+  builtInLayoutsRoot,
+  userLayoutsRoot,
+  builtInModulesRoot,
+  userModulesRoot,
+  trashRoot,
+  maxBodyBytes,
+  fileTransaction,
+  atomicWrite,
+  scheduleBuild,
+});
+
+const netease = createNeteaseService({
+  repoRoot,
+  userLayoutsRoot,
+  builtInLayoutsRoot,
+  atomicWrite,
+  runBuild,
+  network,
+  loadModuleRegistry: layoutModules.loadModuleRegistry,
+  snapshotLayout: layoutModules.snapshotLayout,
 });
 
 const siteSettings = createSiteSettingsService({
@@ -906,100 +435,49 @@ const publishService = createPublishService({
   safeGitFailure,
 });
 
+const importRoutes = createImportRoutes({ readBody, send, fail, importService });
+const settingsRoutes = createSettingsRoutes({ readBody, send, fail, siteSettings });
+const mediaRoutes = createMediaRoutes({
+  readBody,
+  send,
+  fail,
+  importWallpaperMedia,
+  importUploadedVideo,
+  maxMediaBodyBytes,
+});
+const neteaseRoutes = createNeteaseRoutes({ readBody, send, fail, netease });
+const publishRoutes = createPublishRoutes({
+  repoRoot,
+  readBody,
+  send,
+  fail,
+  publishService,
+  git,
+  gitChanges,
+  systemGitProxy,
+  exists,
+});
+const layoutModuleRoutes = createLayoutModuleRoutes({ readBody, send, fail, layoutModules });
+const resourceRoutes = createResourceRoutes({
+  readBody,
+  send,
+  fail,
+  resourceService,
+  maxMediaBodyBytes,
+});
+
 async function handleApi(req, res, url) {
   const pathname = url.pathname;
   if (['POST', 'PUT', 'PATCH', 'DELETE'].includes(req.method) && !adminOriginAllowed(req)) {
     return fail(res, 403, '仅允许从本机 lilymap 页面发起写入请求。');
   }
-  if (req.method === 'POST' && pathname === '/api/import/inspect') {
-    try {
-      const request = JSON.parse((await readBody(req, 20 * 1024 * 1024)).toString('utf8'));
-      const plan = await prepareImport(request);
-      return send(res, 200, { ...plan, raw: undefined, assetCount: plan.assets.length, rewriteCount: (plan.rewrites || []).length });
-    } catch (error) { return fail(res, 400, error.message || '导入内容无效。'); }
-  }
-  if (req.method === 'POST' && pathname === '/api/import') {
-    let plan;
-    try {
-      const request = JSON.parse((await readBody(req, 20 * 1024 * 1024)).toString('utf8'));
-      plan = await prepareImport(request);
-    } catch (error) { return fail(res, 400, error.message || '导入内容无效。'); }
-    const destination = path.join(contentRoot, 'posts', plan.slug);
-    if (await exists(destination)) return fail(res, 409, '目标文章目录已存在。');
-    await fs.mkdir(destination, { recursive: true });
-    const createdStatic = [];
-    const publicSnapshots = [];
-    try {
-      // 先验证会写入的 static 资源，防止导入完成一半才发现同名文件冲突。
-      for (const copy of plan.staticCopies || []) {
-        const dest = inside(repoRoot, copy.to);
-        if (!dest) throw new Error('资源路径不安全。');
-        if (await exists(dest)) {
-          const sourceBytes = await fs.readFile(copy.from);
-          const currentBytes = await fs.readFile(dest);
-          if (!currentBytes.equals(sourceBytes)) throw httpError(409, `目标资源已存在且内容不同：${relativeToRepo(dest)}。`);
-        }
-      }
-      await atomicWrite(path.join(destination, 'index.md'), plan.raw, { schedule: false });
-      for (const asset of plan.assets) {
-        const relative = asset.targetParts.join('/');
-        if (!relative || relative.startsWith('..') || path.isAbsolute(relative)) throw new Error('资源路径不安全。');
-        const target = inside(destination, relative);
-        if (!target || !uploadImageExtensions.has(path.extname(target).toLowerCase())) continue;
-        const bytes = asset.diskPath ? await fs.readFile(asset.diskPath) : Buffer.from(String(asset.content || ''), 'base64');
-        if (!hasExpectedImageSignature(bytes, path.extname(target))) throw new Error(`图片 ${path.basename(target)} 的内容与扩展名不匹配或已损坏。`);
-        await atomicCreate(target, bytes);
-      }
-      for (const copy of plan.staticCopies || []) {
-        const dest = inside(repoRoot, copy.to);
-        if (!dest) continue;
-        const copyResult = await copyWithoutClobber(copy.from, dest);
-        if (copyResult === 'created') createdStatic.push(dest);
-
-        const publicDest = path.join(repoRoot, 'public', ...copy.to.replace(/^static\//, '').split('/'));
-        const previousPublic = await fs.readFile(publicDest).then((bytes) => ({ existed: true, bytes })).catch((error) => {
-          if (error?.code === 'ENOENT') return { existed: false, bytes: null };
-          throw error;
-        });
-        publicSnapshots.push({ target: publicDest, ...previousPublic });
-        await atomicWrite(publicDest, await fs.readFile(copy.from), { schedule: false });
-      }
-      scheduleBuild();
-    } catch (error) {
-      for (const snapshot of publicSnapshots.reverse()) {
-        try {
-          if (snapshot.existed) await atomicWrite(snapshot.target, snapshot.bytes, { schedule: false });
-          else await fs.rm(snapshot.target, { force: true });
-        } catch {}
-      }
-      await Promise.all(createdStatic.map((target) => fs.rm(target, { force: true }).catch(() => {})));
-      await fs.rename(destination, path.join(trashRoot, `failed-import-${randomUUID()}`)).catch(() => {});
-      throw error;
-    }
-    return send(res, 201, { ok: true, path: relativeToRepo(path.join(destination, 'index.md')), assetCount: plan.assets.length, missing: plan.missing, rewriteCount: (plan.rewrites || []).length });
-  }
-  if (req.method === 'GET' && pathname === '/api/status') {
-    const [changes, branch, head, blog, mediaTools] = await Promise.all([gitChanges(), git(['branch', '--show-current']), git(['log', '-1', '--format=%h%x00%s%x00%aI']), blogStatus(), mediaToolsStatus()]);
-    const postCount = (await listPosts(changes)).filter((post) => post.path.startsWith('content/posts/')).length;
-    return send(res, 200, {
-      apiVersion: 6,
-      repoRoot,
-      paths: {
-        repository: repoRoot,
-        content: contentRoot,
-        static: staticRoot,
-        siteAssets: siteAssetsRoot,
-        public: hugoPublicRoot,
-        publicAssetPrefix: '/assets/',
-      },
-      theme: { name: themeName, root: themeRoot, compatible: await exists(path.join(themeRoot, 'theme-config.schema.json')) },
-      hugo: { executable: hugoExecutable, source: hugoSource, bundled: await exists(bundledHugoExecutable) },
-      mediaTools,
-      branch: branch.stdout.trim(), changes, postCount, blogUrl: blog.url, blogLanUrl: blog.lanUrl,
-      blogRunning: blog.running, blogStatus: blog.status, preview: blog, build: buildSnapshot(),
-      head: head.stdout.trim().split('\0'),
-    });
-  }
+  if (await importRoutes(req, res, url)) return;
+  if (await settingsRoutes(req, res, url)) return;
+  if (await mediaRoutes(req, res, url)) return;
+  if (await neteaseRoutes(req, res, url)) return;
+  if (await publishRoutes(req, res, url)) return;
+  if (await layoutModuleRoutes(req, res, url)) return;
+  if (await resourceRoutes(req, res, url)) return;
   if (req.method === 'GET' && pathname === '/api/posts') return send(res, 200, { posts: await listPosts() });
   if (req.method === 'GET' && pathname === '/api/admin/export') {
     const archive = await createLilyMapSourceArchive({ repoRoot, adminDir });
@@ -1008,16 +486,6 @@ async function handleApi(req, res, url) {
     return;
   }
   if (req.method === 'GET' && pathname === '/api/drawers') return send(res, 200, await readDrawers());
-  if (req.method === 'GET' && pathname === '/api/friends') return send(res, 200, await siteSettings.readFriends());
-  if (req.method === 'GET' && pathname === '/api/profile') return send(res, 200, await siteSettings.readProfile());
-  if (req.method === 'PUT' && pathname === '/api/profile') {
-    const request = JSON.parse((await readBody(req)).toString('utf8'));
-    return send(res, 200, await siteSettings.updateProfile(request));
-  }
-  if (req.method === 'PUT' && pathname === '/api/friends') {
-    const request = JSON.parse((await readBody(req)).toString('utf8'));
-    return send(res, 200, await siteSettings.updateFriends(request));
-  }
   if (req.method === 'PUT' && pathname === '/api/drawers') {
     const request = JSON.parse((await readBody(req)).toString('utf8'));
     const current = await readDrawers();
@@ -1219,221 +687,6 @@ async function handleApi(req, res, url) {
     scheduleBuild();
     return send(res, 201, { ok: true, markdown: `![${path.parse(name).name}](${name})`, path: relativeToRepo(destination) });
   }
-  if (req.method === 'POST' && pathname === '/api/asset/upload') {
-    const name = path.basename(url.searchParams.get('name') || '');
-    const area = String(url.searchParams.get('area') || 'static/assets/img');
-    if (!name || !uploadImageExtensions.has(path.extname(name).toLowerCase())) return fail(res, 400, '仅允许上传 PNG、JPG、WebP、GIF 或 AVIF 图片资源。');
-    const dirInRepo = canonicalAssetDirectory(area);
-    if (!dirInRepo) return fail(res, 400, '站点资源统一写入 static/assets，请选择该目录下的安全子目录。');
-    await fs.mkdir(dirInRepo, { recursive: true });
-    const bytes = await readBody(req, 24 * 1024 * 1024);
-    if (!hasExpectedImageSignature(bytes, path.extname(name))) return fail(res, 400, '图片内容与扩展名不匹配或文件已损坏。');
-    const sourcePath = path.join(dirInRepo, name);
-    await atomicCreate(sourcePath, bytes);
-    const preview = await syncStaticPreview(sourcePath);
-    return send(res, 201, { ok: true, path: publicPathForRepoFile(sourcePath), file: relativeToRepo(sourcePath), ...preview });
-  }
-  if (req.method === 'POST' && pathname === '/api/media/import') {
-    try {
-      const request = JSON.parse((await readBody(req, 64 * 1024)).toString('utf8'));
-      return send(res, 201, await importWallpaperMedia(String(request.sourcePath || ''), request.target));
-    } catch (error) {
-      return fail(res, Number.isInteger(error.statusCode) ? error.statusCode : 400, error.message || '媒体导入失败。');
-    }
-  }
-  if (req.method === 'POST' && pathname === '/api/media/upload') {
-    const name = path.basename(url.searchParams.get('name') || '');
-    const targetName = String(url.searchParams.get('target') || '');
-    const extension = path.extname(name).toLowerCase();
-    if (!mediaTargetNames.has(targetName) || !uploadVideoExtensions.has(extension)) return fail(res, 400, '视频壁纸支持 MP4、WebM、MOV、M4V、MKV 或 AVI。');
-    const temporaryRoot = path.join(repoRoot, '.admin-tmp');
-    const temporary = path.join(temporaryRoot, `${randomUUID()}${extension}`);
-    try {
-      await fs.mkdir(temporaryRoot, { recursive: true });
-      await fs.writeFile(temporary, await readBody(req, maxMediaBodyBytes), { flag: 'wx' });
-      return send(res, 201, await importWallpaperMedia(temporary, targetName));
-    } catch (error) {
-      return fail(res, Number.isInteger(error.statusCode) ? error.statusCode : 400, error.message || '视频上传失败。');
-    } finally {
-      await fs.rm(temporary, { force: true }).catch(() => {});
-    }
-  }
-  if (req.method === 'GET' && pathname === '/api/files') {
-    const roots = [contentRoot, staticRoot, path.join(repoRoot, 'assets'), path.join(repoRoot, 'data')];
-    const availableRoots = [];
-    for (const root of roots) if (await exists(root)) availableRoots.push(root);
-    const files = (await Promise.all(availableRoots.map(async (root) => walk(root, () => true)))).flat();
-    const entries = await Promise.all(files.map(async (file) => {
-      const stat = await fs.stat(file);
-      const relative = relativeToRepo(file);
-      return {
-        path: relative,
-        publicPath: publicPathForRepoFile(file),
-        scope: relative.startsWith('static/') ? 'public' : relative.startsWith('assets/') ? 'pipeline' : relative.startsWith('content/') ? 'content' : 'data',
-        kind: mediaKind(file),
-        size: stat.size,
-        modifiedAt: stat.mtime.toISOString(),
-        extension: path.extname(file).slice(1).toLowerCase(),
-      };
-    }));
-    return send(res, 200, { files: entries.sort((a, b) => a.path.localeCompare(b.path)) });
-  }
-  if (['PUT', 'PATCH', 'DELETE'].includes(req.method) && pathname === '/api/file') {
-    const target = managedResourcePath(url.searchParams.get('path'));
-    if (!target || !(await exists(target)) || !(await fs.stat(target)).isFile()) return fail(res, 404, '可管理的图片或视频不存在。');
-    if (req.method === 'PATCH') {
-      const request = JSON.parse((await readBody(req, 4096)).toString('utf8'));
-      const name = String(request.name || '').trim();
-      if (!name || path.basename(name) !== name || !/^[\p{L}\p{N}._-]+$/u.test(name) || path.extname(name).toLowerCase() !== path.extname(target).toLowerCase()) return fail(res, 400, '新文件名无效；请保持原扩展名。');
-      const destination = path.join(path.dirname(target), name);
-      if (await exists(destination)) return fail(res, 409, '新文件名已存在。');
-      await fs.rename(target, destination);
-      scheduleBuild();
-      return send(res, 200, { ok: true, path: relativeToRepo(destination) });
-    }
-    const backup = path.join(trashRoot, 'resources', `${randomUUID()}-${path.basename(target)}`);
-    await fs.mkdir(path.dirname(backup), { recursive: true });
-    if (req.method === 'DELETE') {
-      await fs.rename(target, backup);
-      scheduleBuild();
-      return send(res, 200, { ok: true, trashedTo: relativeToRepo(backup) });
-    }
-    const bytes = await readBody(req, mediaKind(target) === 'video' ? maxMediaBodyBytes : 24 * 1024 * 1024);
-    if (mediaKind(target) === 'image' && !hasExpectedImageSignature(bytes, path.extname(target))) return fail(res, 400, '新图片内容与原扩展名不匹配。');
-    if (mediaKind(target) === 'video') {
-      if (path.extname(target).toLowerCase() !== '.mp4') return fail(res, 400, '视频替换目前只支持 MP4；其他格式可先上传新文件。');
-      const probeFile = path.join(trashRoot, 'resources', `${randomUUID()}.mp4`);
-      await fs.writeFile(probeFile, bytes, { flag: 'wx' });
-      try { await inspectMedia(probeFile); } finally { await fs.rm(probeFile, { force: true }); }
-    }
-    await fs.rename(target, backup);
-    try { await atomicWrite(target, bytes); }
-    catch (error) { await fs.rename(backup, target).catch(() => {}); throw error; }
-    return send(res, 200, { ok: true, backup: relativeToRepo(backup) });
-  }
-  if (req.method === 'GET' && pathname === '/api/settings') {
-    return send(res, 200, await siteSettings.readSettings());
-  }
-  if (req.method === 'PATCH' && pathname === '/api/settings') {
-    const request = JSON.parse((await readBody(req)).toString('utf8'));
-    return send(res, 200, await siteSettings.patchSettings(request));
-  }
-  if (req.method === 'PUT' && pathname === '/api/settings') {
-    const request = JSON.parse((await readBody(req)).toString('utf8'));
-    return send(res, 200, await siteSettings.replaceSettingsRaw(request));
-  }
-  if (req.method === 'GET' && pathname === '/api/modules') {
-    const { modules, usage } = await moduleUsage();
-    return send(res, 200, { protocol: 'lily-module/v1', modules: Object.values(modules).sort((a, b) => a.name.localeCompare(b.name)), usage });
-  }
-  if (req.method === 'POST' && pathname === '/api/modules/install') {
-    try { return send(res, 201, { ok: true, ...(await installSiteModule(JSON.parse((await readBody(req)).toString('utf8')))) }); }
-    catch (error) { return fail(res, 400, error.message || '模块安装失败。'); }
-  }
-  if (req.method === 'PUT' && pathname === '/api/modules/config') {
-    try {
-      const request = JSON.parse((await readBody(req)).toString('utf8'));
-      if (!/^[\w-]+$/.test(request.layout || '')) throw new Error('布局名称不合法。');
-      const { layouts, modules } = await loadLayoutEditor();
-      const current = layouts.find((entry) => entry.name === request.layout);
-      if (!current) throw new Error('布局不存在。');
-      const { layout, placement } = updateModulePlacement(current.parsed, modules, request);
-      const target = inside(userLayoutsRoot, `${request.layout}.yaml`);
-      if (!target) throw new Error('布局路径不安全。');
-      const backup = await snapshotLayout(request.layout, target);
-      await atomicWrite(target, serializeLayout(layout));
-      scheduleBuild();
-      return send(res, 200, { ok: true, placement, backup });
-    } catch (error) { return fail(res, error.statusCode || 400, error.message || '保存模块失败。'); }
-  }
-  if (req.method === 'POST' && pathname === '/api/music/netease/import') {
-    try { return send(res, 201, { ok: true, ...(await importNeteasePlaylist(JSON.parse((await readBody(req, 32 * 1024)).toString('utf8')))) }); }
-    catch (error) { return fail(res, 400, error.message || '网易云歌单导入失败。'); }
-  }
-  if (req.method === 'GET' && pathname === '/api/music/netease/status') {
-    try { return send(res, 200, await neteaseSnapshotStatus(url.searchParams.get('id'))); }
-    catch (error) { return fail(res, 400, error.message || '读取网易云歌单状态失败。'); }
-  }
-  if (req.method === 'GET' && pathname === '/api/music/netease/list') {
-    try { return send(res, 200, await listNeteaseSnapshots()); }
-    catch (error) { return fail(res, 500, error.message || '读取网易云歌单列表失败。'); }
-  }
-  if (req.method === 'GET' && pathname === '/api/music/netease/tracks') {
-    try { return send(res, 200, await neteaseSnapshotTracks(url.searchParams.get('id'))); }
-    catch (error) { return fail(res, 400, error.message || '读取歌单歌曲失败。'); }
-  }
-  if (req.method === 'POST' && pathname === '/api/music/netease/check') {
-    try { return send(res, 200, await checkNeteaseTrackAvailability(JSON.parse((await readBody(req, 8 * 1024)).toString('utf8')))); }
-    catch (error) { return fail(res, 400, error.message || '检测歌曲音源失败。'); }
-  }
-  if (req.method === 'POST' && pathname === '/api/music/netease/exclusions') {
-    try { return send(res, 200, { ok: true, ...(await saveNeteaseExclusions(JSON.parse((await readBody(req, 32 * 1024)).toString('utf8')))) }); }
-    catch (error) { return fail(res, 400, error.message || '保存歌单剔除设置失败。'); }
-  }
-  if (req.method === 'POST' && pathname === '/api/music/netease/activate') {
-    try { return send(res, 200, { ok: true, ...(await activateNeteasePlaylist(JSON.parse((await readBody(req, 8 * 1024)).toString('utf8')).playlistId)) }); }
-    catch (error) { return fail(res, 400, error.message || '启用网易云歌单失败。'); }
-  }
-  if (req.method === 'DELETE' && pathname === '/api/modules') {
-    try { return send(res, 200, { ok: true, ...(await uninstallSiteModule(String(url.searchParams.get('id') || ''))) }); }
-    catch (error) { return fail(res, 400, error.message || '模块卸载失败。'); }
-  }
-  if (req.method === 'GET' && pathname === '/api/layouts') {
-    try { return send(res, 200, await loadLayoutEditor()); }
-    catch (error) { return fail(res, 500, error.message || '读取布局失败。'); }
-  }
-  if (req.method === 'PUT' && pathname === '/api/layouts') {
-    const request = JSON.parse((await readBody(req)).toString('utf8'));
-    const name = String(request.name || '');
-    if (!/^[\w-]+$/.test(name)) return fail(res, 400, '布局名称不合法。');
-    const candidate = typeof request.raw === 'string' ? request.raw : (request.parsed ? YAML.stringify(request.parsed) : '');
-    if (!candidate || candidate.length > maxBodyBytes) return fail(res, 400, '布局内容无效。');
-    try {
-      const layout = parseLayout(candidate, `布局 ${name}`);
-      const modules = await loadModuleRegistry();
-      validateLayoutAgainstRegistry(layout, modules);
-      const target = inside(userLayoutsRoot, `${name}.yaml`);
-      if (!target) return fail(res, 400, '布局路径不安全。');
-      const backup = await snapshotLayout(name, target);
-      await atomicWrite(target, serializeLayout(layout));
-      return send(res, 200, { ok: true, path: relativeToRepo(target), source: 'site', backup });
-    } catch (error) { return fail(res, 400, error.message || '布局内容无效。'); }
-  }
-  if (req.method === 'GET' && pathname === '/api/layouts/history') {
-    try { return send(res, 200, { history: await layoutHistory(String(url.searchParams.get('name') || '')) }); }
-    catch (error) { return fail(res, 400, error.message || '读取布局历史失败。'); }
-  }
-  if (req.method === 'POST' && pathname === '/api/layouts/restore') {
-    try {
-      const request = JSON.parse((await readBody(req)).toString('utf8'));
-      const name = String(request.name || ''); const revision = String(request.revision || '');
-      if (!/^[\w-]+$/.test(name) || !/^\d{4}-\d{2}-\d{2}T[\d-]+Z\.yaml$/.test(revision)) throw new Error('布局历史版本无效。');
-      const source = inside(layoutRevisionRoot(name), revision);
-      const target = inside(userLayoutsRoot, `${name}.yaml`);
-      if (!source || !target || !(await exists(source))) throw new Error('布局历史版本不存在。');
-      const layout = parseLayout(await fs.readFile(source, 'utf8'), `布局历史 ${name}`);
-      validateLayoutAgainstRegistry(layout, await loadModuleRegistry());
-      const backup = await snapshotLayout(name, target);
-      await atomicWrite(target, serializeLayout(layout));
-      return send(res, 200, { ok: true, path: relativeToRepo(target), backup });
-    } catch (error) { return fail(res, 400, error.message || '恢复布局失败。'); }
-  }
-  if (req.method === 'POST' && pathname === '/api/layouts/reset') {
-    try {
-      const request = JSON.parse((await readBody(req)).toString('utf8'));
-      const name = String(request.name || '');
-      if (!/^[\w-]+$/.test(name)) throw new Error('布局名称不合法。');
-      const target = inside(userLayoutsRoot, `${name}.yaml`);
-      const builtIn = inside(builtInLayoutsRoot, `${name}.yaml`);
-      if (!target || !builtIn || !(await exists(target)) || !(await exists(builtIn))) throw new Error('该布局没有可恢复的主题默认版本。');
-      const stamp = new Date().toISOString().replace(/[:.]/g, '-');
-      const destination = path.join(layoutRevisionRoot(name), `override-${stamp}.yaml`);
-      await fs.mkdir(path.dirname(destination), { recursive: true });
-      await fs.rename(target, destination);
-      scheduleBuild();
-      return send(res, 200, { ok: true, restoredSource: 'built-in', trashedTo: relativeToRepo(destination) });
-    } catch (error) { return fail(res, 400, error.message || '恢复主题默认失败。'); }
-  }
   if (req.method === 'GET' && pathname === '/api/git/diff') {
     const target = url.searchParams.get('path');
     const args = target && !path.isAbsolute(target) && !target.includes('..') ? ['diff', '--', target] : ['diff', '--stat'];
@@ -1447,78 +700,6 @@ async function handleApi(req, res, url) {
       error: result.code === 0 ? undefined : 'Hugo 构建失败。',
       ...result,
     });
-  }
-  if (req.method === 'GET' && pathname === '/api/publish/status') {
-    const remote = await git(['remote', 'get-url', 'github']);
-    const targetRemote = await publishService.remote();
-    const remoteOk = Boolean(targetRemote) && remote.code === 0 && remote.stdout.trim().toLowerCase().replace(/\.git$/, '') === targetRemote.toLowerCase().replace(/\.git$/, '');
-    let commitsAhead = '0';
-    try { const ahead = await git(['rev-list', '--count', 'HEAD', '--not', '--remotes=github']); commitsAhead = ahead.stdout.trim() || '0'; } catch {}
-    return send(res, 200, {
-      allowedRemote: targetRemote.replace(/\.git$/, ''),
-      allowedBranch: await publishService.branch(),
-      remote: remote.code === 0 ? remote.stdout.trim() : '',
-      remoteOk,
-      tokenPresent: await publishService.tokenPresent(),
-      systemProxyDetected: Boolean(await systemGitProxy()),
-      workflowPresent: await exists(path.join(repoRoot, '.github', 'workflows', 'hugo.yaml')),
-      branch: (await git(['branch', '--show-current'])).stdout.trim(),
-      changes: await gitChanges(),
-      commitsAhead,
-      publishJob: publishSnapshot(),
-    });
-  }
-  if (req.method === 'PUT' && pathname === '/api/publish/target') {
-    if (publishState?.status === 'running') return fail(res, 409, '发布进行中，暂不能切换目标。');
-    try {
-      const request = JSON.parse((await readBody(req, 4096)).toString('utf8'));
-      const result = await publishService.setTarget(request.remote, request.branch);
-      return send(res, 200, { ok: true, ...result });
-    } catch (error) {
-      return fail(res, Number.isInteger(error.statusCode) ? error.statusCode : 500, error.message || '无法更新发布目标。');
-    }
-  }
-  if (req.method === 'PUT' && pathname === '/api/publish/token') {
-    if (publishState?.status === 'running') return fail(res, 409, '发布进行中，暂不能修改认证令牌。');
-    try {
-      const request = JSON.parse((await readBody(req, 4096)).toString('utf8'));
-      return send(res, 200, { ok: true, ...(await publishService.saveToken(request.token)) });
-    } catch (error) {
-      return fail(res, Number.isInteger(error.statusCode) ? error.statusCode : 500, error.message || '无法保存认证令牌。');
-    }
-  }
-  if (req.method === 'GET' && pathname === '/api/publish/progress') {
-    const id = url.searchParams.get('id');
-    if (!publishState || (id && id !== publishState.id)) return fail(res, 404, '没有找到这次发布任务。');
-    return send(res, 200, publishSnapshot());
-  }
-  if (req.method === 'POST' && pathname === '/api/publish') {
-    let request = {}; try { request = JSON.parse((await readBody(req)).toString('utf8')); } catch {}
-    const force = request.force === true;
-    const commitMessage = String(request.commit || '').trim();
-    if (publishState?.status === 'running') return fail(res, 409, '已有发布任务正在执行，请等待当前进度完成。');
-    publishState = {
-      id: randomUUID(), status: 'running', progress: 2, stage: '正在准备发布',
-      message: '', error: '', force, startedAt: new Date().toISOString(), finishedAt: null,
-    };
-    const report = (progress, stage) => {
-      if (publishState?.status !== 'running') return;
-      publishState.progress = Math.max(publishState.progress, Math.min(100, Number(progress) || 0));
-      publishState.stage = String(stage || publishState.stage).slice(0, 160);
-    };
-    void publishService.publishToBlog(commitMessage, force, report).then((result) => {
-      publishState.status = 'complete';
-      publishState.progress = 100;
-      publishState.stage = '发布完成';
-      publishState.message = result.message;
-      publishState.finishedAt = new Date().toISOString();
-    }).catch((error) => {
-      publishState.status = 'failed';
-      publishState.stage = '发布失败';
-      publishState.error = String(error?.message || '发布失败。').slice(0, 1000);
-      publishState.finishedAt = new Date().toISOString();
-    });
-    return send(res, 202, { ok: true, ...publishSnapshot() });
   }
   return fail(res, 404, '未知 API。');
 }
