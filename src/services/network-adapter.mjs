@@ -103,5 +103,35 @@ export function createNetworkAdapter({
     };
   }
 
-  return { requestText, requestJson, requestMetadata, validateUrl };
+  async function requestMetadataFollowing(input, {
+    allowedHosts = [],
+    allowHostname,
+    headers = {},
+    timeoutMs = 20_000,
+    maxRedirects = 3,
+  } = {}) {
+    let current = validateUrl(input, allowedHosts, allowHostname);
+    let currentHeaders = { ...headers };
+    for (let redirectCount = 0; redirectCount <= maxRedirects; redirectCount += 1) {
+      const result = await requestMetadata(current, {
+        allowedHosts,
+        allowHostname,
+        headers: currentHeaders,
+        timeoutMs,
+        redirect: 'manual',
+      });
+      if (result.status < 300 || result.status >= 400 || !result.location) return result;
+      if (redirectCount === maxRedirects) throw networkError('远程服务重定向次数过多。', 'TOO_MANY_REDIRECTS');
+      const next = validateUrl(new URL(result.location, current).href, allowedHosts, allowHostname);
+      if (next.hostname !== current.hostname) {
+        for (const key of Object.keys(currentHeaders)) {
+          if (/^(?:cookie|authorization|proxy-authorization)$/i.test(key)) delete currentHeaders[key];
+        }
+      }
+      current = next;
+    }
+    throw networkError('远程服务重定向次数过多。', 'TOO_MANY_REDIRECTS');
+  }
+
+  return { requestText, requestJson, requestMetadata, requestMetadataFollowing, validateUrl };
 }
