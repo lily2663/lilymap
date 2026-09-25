@@ -27,7 +27,7 @@ function syncOperationProgress() {
   $('#operation-count').textContent = activeOperations.size > 1 ? `${activeOperations.size} 项任务` : '进行中';
 }
 
-function beginOperation(label) {
+export function beginOperation(label) {
   const id = ++operationSequence;
   clearTimeout(operationHideTimer);
   activeOperations.set(id, label);
@@ -36,7 +36,7 @@ function beginOperation(label) {
   return id;
 }
 
-function endOperation(id) {
+export function endOperation(id) {
   if (id == null) return;
   activeOperations.delete(id);
   if (activeOperations.size) { syncOperationProgress(); return; }
