@@ -28,6 +28,10 @@ import { isObject, parseYaml } from './src/domain/value.mjs';
 import { normalizeLayout, normalizeModuleManifest, parseLayout, serializeLayout, validateLayoutAgainstRegistry } from './src/domain/layout.mjs';
 import { createHttpPrimitives } from './src/http/primitives.mjs';
 import { streamFile } from './src/http/static-files.mjs';
+import { createImportRoutes } from './src/http/routes/import-routes.mjs';
+import { createSettingsRoutes } from './src/http/routes/settings-routes.mjs';
+import { createMediaRoutes } from './src/http/routes/media-routes.mjs';
+import { createNeteaseRoutes } from './src/http/routes/netease-routes.mjs';
 import { updateModulePlacement } from './src/domain/module-config.mjs';
 
 // esbuild 打包成 cjs 后 __dirname 可用；dev 模式（node 直接跑 ESM）下 __dirname 不存在，
@@ -575,27 +579,27 @@ const publishService = createPublishService({
   safeGitFailure,
 });
 
+const importRoutes = createImportRoutes({ readBody, send, fail, importService });
+const settingsRoutes = createSettingsRoutes({ readBody, send, fail, siteSettings });
+const mediaRoutes = createMediaRoutes({
+  readBody,
+  send,
+  fail,
+  importWallpaperMedia,
+  importUploadedVideo,
+  maxMediaBodyBytes,
+});
+const neteaseRoutes = createNeteaseRoutes({ readBody, send, fail, netease });
+
 async function handleApi(req, res, url) {
   const pathname = url.pathname;
   if (['POST', 'PUT', 'PATCH', 'DELETE'].includes(req.method) && !adminOriginAllowed(req)) {
     return fail(res, 403, '仅允许从本机 lilymap 页面发起写入请求。');
   }
-  if (req.method === 'POST' && pathname === '/api/import/inspect') {
-    try {
-      const request = JSON.parse((await readBody(req, 20 * 1024 * 1024)).toString('utf8'));
-      return send(res, 200, await importService.inspect(request));
-    } catch (error) {
-      return fail(res, Number.isInteger(error.statusCode) ? error.statusCode : 400, error.message || '导入内容无效。');
-    }
-  }
-  if (req.method === 'POST' && pathname === '/api/import') {
-    try {
-      const request = JSON.parse((await readBody(req, 20 * 1024 * 1024)).toString('utf8'));
-      return send(res, 201, await importService.importRequest(request));
-    } catch (error) {
-      return fail(res, Number.isInteger(error.statusCode) ? error.statusCode : 400, error.message || '导入失败。');
-    }
-  }
+  if (await importRoutes(req, res, url)) return;
+  if (await settingsRoutes(req, res, url)) return;
+  if (await mediaRoutes(req, res, url)) return;
+  if (await neteaseRoutes(req, res, url)) return;
   if (req.method === 'GET' && pathname === '/api/posts') return send(res, 200, { posts: await listPosts() });
   if (req.method === 'GET' && pathname === '/api/admin/export') {
     const archive = await createLilyMapSourceArchive({ repoRoot, adminDir });
@@ -604,16 +608,6 @@ async function handleApi(req, res, url) {
     return;
   }
   if (req.method === 'GET' && pathname === '/api/drawers') return send(res, 200, await readDrawers());
-  if (req.method === 'GET' && pathname === '/api/friends') return send(res, 200, await siteSettings.readFriends());
-  if (req.method === 'GET' && pathname === '/api/profile') return send(res, 200, await siteSettings.readProfile());
-  if (req.method === 'PUT' && pathname === '/api/profile') {
-    const request = JSON.parse((await readBody(req)).toString('utf8'));
-    return send(res, 200, await siteSettings.updateProfile(request));
-  }
-  if (req.method === 'PUT' && pathname === '/api/friends') {
-    const request = JSON.parse((await readBody(req)).toString('utf8'));
-    return send(res, 200, await siteSettings.updateFriends(request));
-  }
   if (req.method === 'PUT' && pathname === '/api/drawers') {
     const request = JSON.parse((await readBody(req)).toString('utf8'));
     const current = await readDrawers();
@@ -829,24 +823,6 @@ async function handleApi(req, res, url) {
     const preview = await syncStaticPreview(sourcePath);
     return send(res, 201, { ok: true, path: publicPathForRepoFile(sourcePath), file: relativeToRepo(sourcePath), ...preview });
   }
-  if (req.method === 'POST' && pathname === '/api/media/import') {
-    try {
-      const request = JSON.parse((await readBody(req, 64 * 1024)).toString('utf8'));
-      return send(res, 201, await importWallpaperMedia(String(request.sourcePath || ''), request.target));
-    } catch (error) {
-      return fail(res, Number.isInteger(error.statusCode) ? error.statusCode : 400, error.message || '媒体导入失败。');
-    }
-  }
-  if (req.method === 'POST' && pathname === '/api/media/upload') {
-    const name = path.basename(url.searchParams.get('name') || '');
-    const targetName = String(url.searchParams.get('target') || '');
-    try {
-      const bytes = await readBody(req, maxMediaBodyBytes);
-      return send(res, 201, await importUploadedVideo({ name, bytes, targetName }));
-    } catch (error) {
-      return fail(res, Number.isInteger(error.statusCode) ? error.statusCode : 400, error.message || '视频上传失败。');
-    }
-  }
   if (req.method === 'GET' && pathname === '/api/files') {
     const roots = [contentRoot, staticRoot, path.join(repoRoot, 'assets'), path.join(repoRoot, 'data')];
     const availableRoots = [];
@@ -900,17 +876,6 @@ async function handleApi(req, res, url) {
     catch (error) { await fs.rename(backup, target).catch(() => {}); throw error; }
     return send(res, 200, { ok: true, backup: relativeToRepo(backup) });
   }
-  if (req.method === 'GET' && pathname === '/api/settings') {
-    return send(res, 200, await siteSettings.readSettings());
-  }
-  if (req.method === 'PATCH' && pathname === '/api/settings') {
-    const request = JSON.parse((await readBody(req)).toString('utf8'));
-    return send(res, 200, await siteSettings.patchSettings(request));
-  }
-  if (req.method === 'PUT' && pathname === '/api/settings') {
-    const request = JSON.parse((await readBody(req)).toString('utf8'));
-    return send(res, 200, await siteSettings.replaceSettingsRaw(request));
-  }
   if (req.method === 'GET' && pathname === '/api/modules') {
     const { modules, usage } = await moduleUsage();
     return send(res, 200, { protocol: 'lily-module/v1', modules: Object.values(modules).sort((a, b) => a.name.localeCompare(b.name)), usage });
@@ -934,50 +899,6 @@ async function handleApi(req, res, url) {
       scheduleBuild();
       return send(res, 200, { ok: true, placement, backup });
     } catch (error) { return fail(res, error.statusCode || 400, error.message || '保存模块失败。'); }
-  }
-  if (req.method === 'POST' && pathname === '/api/music/netease/import') {
-    try {
-      const request = JSON.parse((await readBody(req, 32 * 1024)).toString('utf8'));
-      return send(res, 201, { ok: true, ...(await netease.importPlaylist(request)) });
-    } catch (error) {
-      return fail(res, Number.isInteger(error.statusCode) ? error.statusCode : 400, error.message || '网易云歌单导入失败。');
-    }
-  }
-  if (req.method === 'GET' && pathname === '/api/music/netease/status') {
-    try { return send(res, 200, await netease.snapshotStatus(url.searchParams.get('id'))); }
-    catch (error) { return fail(res, Number.isInteger(error.statusCode) ? error.statusCode : 400, error.message || '读取网易云歌单状态失败。'); }
-  }
-  if (req.method === 'GET' && pathname === '/api/music/netease/list') {
-    try { return send(res, 200, await netease.listSnapshots()); }
-    catch (error) { return fail(res, Number.isInteger(error.statusCode) ? error.statusCode : 500, error.message || '读取网易云歌单列表失败。'); }
-  }
-  if (req.method === 'GET' && pathname === '/api/music/netease/tracks') {
-    try { return send(res, 200, await netease.snapshotTracks(url.searchParams.get('id'))); }
-    catch (error) { return fail(res, Number.isInteger(error.statusCode) ? error.statusCode : 400, error.message || '读取歌单歌曲失败。'); }
-  }
-  if (req.method === 'POST' && pathname === '/api/music/netease/check') {
-    try {
-      const request = JSON.parse((await readBody(req, 8 * 1024)).toString('utf8'));
-      return send(res, 200, await netease.checkTrackAvailability(request));
-    } catch (error) {
-      return fail(res, Number.isInteger(error.statusCode) ? error.statusCode : 400, error.message || '检测歌曲音源失败。');
-    }
-  }
-  if (req.method === 'POST' && pathname === '/api/music/netease/exclusions') {
-    try {
-      const request = JSON.parse((await readBody(req, 32 * 1024)).toString('utf8'));
-      return send(res, 200, { ok: true, ...(await netease.saveExclusions(request)) });
-    } catch (error) {
-      return fail(res, Number.isInteger(error.statusCode) ? error.statusCode : 400, error.message || '保存歌单剔除设置失败。');
-    }
-  }
-  if (req.method === 'POST' && pathname === '/api/music/netease/activate') {
-    try {
-      const request = JSON.parse((await readBody(req, 8 * 1024)).toString('utf8'));
-      return send(res, 200, { ok: true, ...(await netease.activatePlaylist(request.playlistId)) });
-    } catch (error) {
-      return fail(res, Number.isInteger(error.statusCode) ? error.statusCode : 400, error.message || '启用网易云歌单失败。');
-    }
   }
   if (req.method === 'DELETE' && pathname === '/api/modules') {
     try { return send(res, 200, { ok: true, ...(await uninstallSiteModule(String(url.searchParams.get('id') || ''))) }); }
