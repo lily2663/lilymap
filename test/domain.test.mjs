@@ -5,7 +5,7 @@ import path from 'node:path';
 import YAML from 'yaml';
 
 import { formatYamlValue, parseFrontMatter, patchFrontMatter } from '../src/domain/front-matter.mjs';
-import { decryptProtectedBody, encryptProtectedBody } from '../src/domain/protected-content.mjs';
+import { decryptProtectedBody, encryptProtectedBody, validateProtectedPayload } from '../src/domain/protected-content.mjs';
 import { normalizeLayout, normalizeModuleManifest, validateLayoutAgainstRegistry } from '../src/domain/layout.mjs';
 import { validateFriends, validateProfile } from '../src/domain/profile.mjs';
 import { parseToml, patchMenus, patchTomlValue } from '../src/domain/toml.mjs';
@@ -118,4 +118,15 @@ test('theme protocol fixtures remain compatible with LilyMap', { skip: !process.
   for (const fixture of fixtures.invalid || []) {
     assert.throws(() => normalizeModuleManifest(fixture.fileId, YAML.stringify(fixture.manifest), 'fixture'), undefined, fixture.name);
   }
+});
+
+
+test('protected payload validation pins cryptographic parameters and page identity', () => {
+  const payload = encryptProtectedBody('page-id', 'secret body', 'correct-password');
+  assert.doesNotThrow(() => validateProtectedPayload(payload, 'page-id'));
+  assert.throws(() => validateProtectedPayload({ ...payload, pageId: 'other' }, 'page-id'), /ID/);
+  assert.throws(() => validateProtectedPayload({ ...payload, kdf: { ...payload.kdf, hash: 'SHA-1' } }, 'page-id'), /KDF/);
+  assert.throws(() => validateProtectedPayload({ ...payload, cipher: { ...payload.cipher, iv: Buffer.alloc(8).toString('base64') } }, 'page-id'), /iv/);
+  assert.throws(() => validateProtectedPayload({ ...payload, cipher: { ...payload.cipher, tag: 'not base64' } }, 'page-id'), /tag/);
+  assert.equal(decryptProtectedBody(payload, 'correct-password', 'page-id'), 'secret body');
 });
