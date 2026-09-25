@@ -7,7 +7,8 @@ export function validatePublishToken(value) {
 export function redactGitCredentials(value, token = '') {
   let detail = String(value || '未知 Git 错误').trim();
   if (token) detail = detail.split(token).join('[REDACTED]');
-  return detail.replace(/https:\/\/[^\s@]+@github\.com/gi, 'https://[REDACTED]@github.com');
+  detail = detail.replace(/https:\/\/[^\s@]+@github\.com/gi, 'https://[REDACTED]@github.com');
+  return detail.replace(/\b(https?:\/\/)[^\s/@:]+:[^\s/@]+@/gi, '$1[REDACTED]@');
 }
 
 export function isSensitivePublishPath(value) {
