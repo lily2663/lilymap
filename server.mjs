@@ -5,9 +5,13 @@ import fsSync from 'node:fs';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { gzipSync } from 'node:zlib';
 import { networkInterfaces } from 'node:os';
 import { resolveInside } from './src/fs/path-security.mjs';
+import { createAtomicFileService } from './src/fs/atomic-files.mjs';
+import { createLilyMapSourceArchive } from './src/services/source-archive.mjs';
+import { createBuildService } from './src/services/build-service.mjs';
+import { createImportPlanner } from './src/services/import-planner.mjs';
+import { safeSlug } from './src/domain/slug.mjs';
 import YAML from 'yaml';
 import { formatYamlValue, parseFrontMatter, patchFrontMatter } from './src/domain/front-matter.mjs';
 import { parseToml, patchMenus, patchTomlValue } from './src/domain/toml.mjs';
@@ -17,6 +21,7 @@ import { normalizeLayout, normalizeModuleManifest, parseLayout, serializeLayout,
 import { validateFriends, validateProfile } from './src/domain/profile.mjs';
 import { validateMenus, validateThemeSettingsPatch } from './src/domain/theme-config.mjs';
 import { createHttpPrimitives } from './src/http/primitives.mjs';
+import { streamFile } from './src/http/static-files.mjs';
 import { updateModulePlacement } from './src/domain/module-config.mjs';
 import { isSensitivePublishPath, publishPushArguments, redactGitCredentials, validatePublishToken } from './src/domain/publish-security.mjs';
 
@@ -116,7 +121,6 @@ const hugoSource = hugoExecutable === 'hugo' ? '系统 PATH' : hugoExecutable ==
 const maxBodyBytes = 8 * 1024 * 1024;
 const maxMediaBodyBytes = 160 * 1024 * 1024;
 const maxDecodedImageBytes = 64 * 1024 * 1024;
-const maxBuildOutputBytes = 16 * 1024;
 const { adminHostAllowed, adminOriginAllowed, fail, hasExpectedImageSignature, httpError, readBody, send, staticSecurityHeaders } = createHttpPrimitives({
   port,
   maxBodyBytes,
@@ -125,6 +129,7 @@ const { adminHostAllowed, adminOriginAllowed, fail, hasExpectedImageSignature, h
 // lilymap 管理的图片一律限制为栅格格式。SVG 是可执行文档，和管理 API
 // 同源时会扩大本地 XSS 攻击面；已有的主题 SVG 仍可由静态站点正常使用。
 const uploadImageExtensions = new Set(['.png', '.jpg', '.jpeg', '.webp', '.gif', '.avif']);
+const prepareImport = createImportPlanner({ repoRoot, uploadImageExtensions, hasExpectedImageSignature, httpError });
 const uploadVideoExtensions = new Set(['.mp4', '.webm', '.mov', '.m4v', '.mkv', '.avi']);
 const browserVideoExtensions = new Set(['.mp4', '.webm']);
 const mediaTargetNames = new Map([
@@ -139,15 +144,6 @@ const previewState = {
   error: '',
   startedAt: null,
   stoppedAt: null,
-};
-const buildState = {
-  status: 'idle',
-  trigger: '',
-  queuedAt: null,
-  startedAt: null,
-  finishedAt: null,
-  code: null,
-  output: '',
 };
 let publishState = null;
 
@@ -164,16 +160,6 @@ function publishSnapshot() {
     startedAt: publishState.startedAt,
     finishedAt: publishState.finishedAt,
   };
-}
-
-function trimBuildOutput(value) {
-  const output = String(value || '');
-  if (Buffer.byteLength(output, 'utf8') <= maxBuildOutputBytes) return output;
-  return `…（输出已截断）\n${output.slice(-maxBuildOutputBytes)}`;
-}
-
-function buildSnapshot() {
-  return { ...buildState, output: trimBuildOutput(buildState.output) };
 }
 
 function lanPreviewAddresses() {
@@ -309,67 +295,6 @@ async function readProfile() {
     profile: { author: site.author || '', aboutTitle: site.aboutTitle || '', about: site.about || [], links: site.links || [] },
     version: createHash('sha256').update(raw).digest('hex'),
   };
-}
-
-async function lilymapSourceArchive() {
-  const sourceCandidates = [path.join(repoRoot, 'tools', 'admin'), adminDir];
-  const required = ['server.mjs', 'package.json', 'public/index.html', 'src/domain/value.mjs'];
-  let sourceRoot = '';
-  for (const candidate of sourceCandidates) {
-    if ((await Promise.all(required.map((name) => exists(path.join(candidate, ...name.split('/')))))).every(Boolean)) {
-      sourceRoot = candidate;
-      break;
-    }
-  }
-  if (!sourceRoot) throw new Error('当前 LilyMap 源码目录不完整，无法生成迁移包。');
-
-  const topFiles = new Set([
-    'server.mjs', 'package.json', 'package-lock.json', 'README.md', 'DESIGN.md',
-    'CONTRIBUTING.md', 'LICENSE', '.gitignore', 'lilymap.config.schema.json', 'lilymap.json.example',
-  ]);
-  const sourceDirectories = ['src', 'test', 'scripts', 'public', '.github'];
-  const names = [...topFiles].filter((name) => fsSync.existsSync(path.join(sourceRoot, name)));
-  for (const directory of sourceDirectories) {
-    const root = path.join(sourceRoot, directory);
-    if (!(await exists(root))) continue;
-    for (const file of await walk(root, () => true)) {
-      const relative = path.relative(sourceRoot, file).replaceAll('\\', '/');
-      if (!relative || relative.startsWith('../') || path.isAbsolute(relative)) throw new Error('源码导出路径越界。');
-      names.push(relative);
-    }
-  }
-  names.sort();
-  if (!names.length) throw new Error('没有找到可导出的 LilyMap 源码。');
-
-  const blocks = [];
-  let totalBytes = 0;
-  for (const name of names) {
-    const absolute = resolveInside(sourceRoot, name);
-    if (!absolute) throw new Error(`源码导出路径不安全：${name}`);
-    const stat = await fs.stat(absolute);
-    if (!stat.isFile() || stat.size > 8 * 1024 * 1024) throw new Error(`源码文件过大或类型无效：${name}`);
-    totalBytes += stat.size;
-    if (totalBytes > 48 * 1024 * 1024) throw new Error('LilyMap 源码总量超过 48 MB，已停止导出。');
-    const data = await fs.readFile(absolute);
-    const header = Buffer.alloc(512);
-    const entryName = `tools/admin/${name}`;
-    if (Buffer.byteLength(entryName, 'utf8') > 100) throw new Error(`源码路径过长，无法写入迁移包：${name}`);
-    header.write(entryName, 0, 100, 'utf8');
-    header.write('0000644\0', 100, 8, 'ascii');
-    header.write('0000000\0', 108, 8, 'ascii');
-    header.write('0000000\0', 116, 8, 'ascii');
-    header.write(data.length.toString(8).padStart(11, '0') + '\0', 124, 12, 'ascii');
-    header.write('00000000000\0', 136, 12, 'ascii');
-    header.fill(32, 148, 156);
-    header.write('0', 156, 1, 'ascii');
-    header.write('ustar\0', 257, 6, 'ascii');
-    header.write('00', 263, 2, 'ascii');
-    const sum = header.reduce((total, value) => total + value, 0);
-    header.write(sum.toString(8).padStart(6, '0') + '\0 ', 148, 8, 'ascii');
-    blocks.push(header, data, Buffer.alloc((512 - (data.length % 512)) % 512));
-  }
-  blocks.push(Buffer.alloc(1024));
-  return gzipSync(Buffer.concat(blocks));
 }
 
 function layoutRevisionRoot(name) { return path.join(trashRoot, 'layouts', name); }
@@ -721,21 +646,6 @@ async function uninstallSiteModule(id) {
   }
   scheduleBuild();
   return { id, trashedTo: relativeToRepo(destinationRoot) };
-}
-
-function imageReferences(raw) {
-  return [...raw.matchAll(/!\[[^\]]*\]\(([^)\s]+)(?:\s+[^)]*)?\)/g)].map((match) => match[1]).filter((reference) => !/^https?:|^\//i.test(reference));
-}
-
-function importFileName(name) { return String(name || '').replaceAll('\\', '/').split('/').filter(Boolean); }
-
-async function validateImportImageFile(diskPath) {
-  const extension = path.extname(diskPath).toLowerCase();
-  if (!uploadImageExtensions.has(extension)) throw new Error(`导入图片格式不受支持：${path.basename(diskPath)}。`);
-  const stat = await fs.stat(diskPath);
-  if (!stat.isFile() || stat.size > 24 * 1024 * 1024) throw new Error(`导入图片过大或不是普通文件：${path.basename(diskPath)}。`);
-  const bytes = await fs.readFile(diskPath);
-  if (!hasExpectedImageSignature(bytes, extension)) throw new Error(`导入图片内容与扩展名不匹配或已损坏：${path.basename(diskPath)}。`);
 }
 
 function versionFor(raw, stat) { return `${stat.size}:${createHash('sha256').update(raw).digest('hex').slice(0, 16)}`; }
@@ -1169,220 +1079,23 @@ async function remapDrawerPostPath(previous, next = '') {
   if (changed) await atomicWrite(drawersFile, YAML.stringify({ drawers }), { schedule: false });
 }
 
-// 构建管理：admin server 自己持有 Hugo 构建，不再依赖外部 hugo server。
-// 每次内容/配置变更后延迟触发一次一次性构建（约 1.4s），比外部 hugo server
-// 的全量重建更快，且不存在多实例抢 public/ 锁导致的失败。
-// 站点图片上传走 static→public 直拷，即时可见，不触发构建。
-let buildTimer = null;
-let buildChain = Promise.resolve();
+// 构建管理：admin server 自己持有 Hugo 构建，不依赖外部 hugo server。
+const {
+  scheduleBuild,
+  cancelScheduledBuild,
+  runBuild,
+  snapshot: buildSnapshot,
+} = createBuildService({
+  repoRoot,
+  hugoExecutable,
+  maxOutputBytes: 16 * 1024,
+});
 
-function scheduleBuild(delay = 500) {
-  if (buildTimer) clearTimeout(buildTimer);
-  buildState.queuedAt = new Date().toISOString();
-  if (buildState.status !== 'running') buildState.status = 'queued';
-  buildState.trigger = 'scheduled';
-  buildTimer = setTimeout(() => { buildTimer = null; void runBuild(); }, delay);
-}
-
-async function runBuild(minify = false, trigger = 'manual') {
-  if (buildState.status !== 'running') buildState.status = 'queued';
-  buildState.queuedAt ||= new Date().toISOString();
-  buildState.trigger = trigger;
-  const task = buildChain.then(async () => {
-    buildState.status = 'running';
-    buildState.startedAt = new Date().toISOString();
-    buildState.finishedAt = null;
-    buildState.code = null;
-    buildState.output = '';
-    buildState.queuedAt = null;
-    let result;
-    try {
-      // 不碰 Hugo 的构建锁：它也可能属于用户在另一个终端运行的 Hugo 实例。
-      // 本服务自身的构建已由 buildChain 串行化，遇到外部锁时把 Hugo 的诊断原样返回。
-      const args = minify
-        ? ['--gc', '--minify', '--cacheDir', path.join(repoRoot, '.cache', 'hugo')]
-        : ['--cacheDir', path.join(repoRoot, '.cache', 'hugo')];
-      result = await new Promise((resolve) => {
-        const child = spawn(hugoExecutable, args, { cwd: repoRoot, windowsHide: true, shell: false });
-        let output = '';
-        child.stdout.on('data', (data) => { output += data; });
-        child.stderr.on('data', (data) => { output += data; });
-        child.on('close', (code) => resolve({ code: Number.isInteger(code) ? code : 1, output }));
-        child.on('error', (error) => resolve({ code: 1, output: error.message === 'spawn hugo ENOENT' ? '未找到 Hugo。请安装 Hugo，或在 lilymap.json 中设置 hugoPath。' : error.message }));
-      });
-    } catch (error) {
-      result = { code: 1, output: error.message || 'Hugo 构建过程异常。' };
-    }
-    buildState.code = result.code;
-    buildState.output = trimBuildOutput(result.output);
-    buildState.finishedAt = new Date().toISOString();
-    buildState.status = result.code === 0 ? 'success' : 'error';
-    if (result.code !== 0) console.error(`Hugo 构建失败：${buildState.output}`);
-    return { ...result, output: trimBuildOutput(result.output), build: buildSnapshot() };
-  });
-  buildChain = task.catch(() => {});
-  return task;
-}
-
-async function stageFile(target, content) {
-  const directory = path.dirname(target);
-  const temporary = path.join(directory, `.${path.basename(target)}.${randomUUID()}.tmp`);
-  await fs.mkdir(directory, { recursive: true });
-  const handle = await fs.open(temporary, 'wx');
-  try {
-    if (typeof content === 'string') await handle.writeFile(content, 'utf8');
-    else await handle.writeFile(content);
-    await handle.sync();
-  } catch (error) {
-    await handle.close().catch(() => {});
-    await fs.rm(temporary, { force: true }).catch(() => {});
-    throw error;
-  }
-  await handle.close();
-  return temporary;
-}
-
-async function atomicWrite(target, content, { schedule = true } = {}) {
-  const temporary = await stageFile(target, content);
-  try {
-    await fs.rename(temporary, target);
-  } catch (error) {
-    await fs.rm(temporary, { force: true }).catch(() => {});
-    throw error;
-  }
-  if (schedule) scheduleBuild();
-}
-
-// 以硬链接把已经 fsync 的临时文件一次性挂到目标路径，目标存在时原子失败，
-// 从而避免上传两个同名资源时后一个请求静默覆盖前一个文件。
-async function atomicCreate(target, content) {
-  const temporary = await stageFile(target, content);
-  try {
-    await fs.link(temporary, target);
-  } catch (error) {
-    if (error.code === 'EEXIST' || (await exists(target))) throw httpError(409, `同名资源已存在：${relativeToRepo(target)}。`);
-    throw error;
-  } finally {
-    await fs.rm(temporary, { force: true }).catch(() => {});
-  }
-}
-
-async function copyWithoutClobber(source, target) {
-  const bytes = await fs.readFile(source);
-  try {
-    await atomicCreate(target, bytes);
-    return 'created';
-  } catch (error) {
-    if (error.statusCode !== 409) throw error;
-    const current = await fs.readFile(target).catch(() => null);
-    if (current && current.equals(bytes)) return 'existing';
-    throw httpError(409, `目标资源已存在且内容不同：${relativeToRepo(target)}。`);
-  }
-}
-
-async function prepareImport(request) {
-  const files = Array.isArray(request.files) ? request.files : [];
-  const markdown = files.filter((file) => /\.md(?:own)?$/i.test(file.name || '') || /\.markdown$/i.test(file.name || ''));
-  if (markdown.length !== 1) throw new Error('一次导入请选择一个 Markdown 文件（可同时包含它的图片目录）。');
-  const source = markdown[0];
-  const raw = Buffer.from(String(source.content || ''), 'base64').toString('utf8').replace(/^\uFEFF/, '');
-  const parsed = parseFrontMatter(raw);
-  const fileStem = path.basename(source.name, path.extname(source.name));
-  const title = parsed.frontMatter.title || request.title || fileStem;
-  const inferredSlug = String(title || fileStem).trim().toLowerCase().replace(/\s+/g, '-');
-  const slug = safeSlug(parsed.frontMatter.slug || request.slug || inferredSlug || fileStem);
-  if (!slug) throw new Error('无法生成安全的 Slug。');
-  const sourceParts = importFileName(source.relativePath || source.name);
-  const sourceDirectory = sourceParts.slice(0, -1).join('/');
-  const body = parsed.body;
-  const references = imageReferences(body);
-  // Typora often embeds absolute Windows paths for images. Resolve them
-  // against the repo: files under static/ keep their public URL, files under
-  // root assets/ are copied into static/assets/ for deployment, other local
-  // files become bundle images, and missing ones fall back to a bundle
-  // basename so the pick-missing flow can still match them.
-  const absolutePattern = /^(?:[A-Za-z]:[\\/]|\\\\)/;
-  const rewrites = [];
-  const staticCopies = [];
-  const diskAssets = [];
-  for (const reference of [...new Set(references)]) {
-    if (!absolutePattern.test(reference)) continue;
-    let diskPath = null;
-    try {
-      const candidate = path.resolve(reference);
-      if ((await fs.stat(candidate)).isFile()) diskPath = candidate;
-    } catch {}
-    if (!diskPath) { rewrites.push({ from: reference, to: path.basename(reference.replaceAll('\\', '/')) }); continue; }
-    const relativeToRoot = path.relative(repoRoot, diskPath);
-    const inRepo = relativeToRoot && !relativeToRoot.startsWith('..') && !path.isAbsolute(relativeToRoot);
-    const normalized = inRepo ? relativeToRoot.replaceAll('\\', '/') : '';
-    if (inRepo && normalized.startsWith('static/')) {
-      rewrites.push({ from: reference, to: `/${normalized.slice('static/'.length)}` });
-    } else if (inRepo && normalized.startsWith('assets/')) {
-      await validateImportImageFile(diskPath);
-      staticCopies.push({ from: diskPath, to: normalized.replace(/^assets\//, 'static/assets/') });
-      rewrites.push({ from: reference, to: `/${normalized}` });
-    } else {
-      await validateImportImageFile(diskPath);
-      const base = path.basename(diskPath);
-      if (!diskAssets.some((asset) => asset.diskPath === diskPath)) diskAssets.push({ name: base, diskPath, parts: [base], targetParts: [base] });
-      rewrites.push({ from: reference, to: base });
-    }
-  }
-  rewrites.sort((a, b) => b.from.length - a.from.length);
-  let rewritten = raw;
-  for (const rewrite of rewrites) rewritten = rewritten.split(rewrite.from).join(rewrite.to);
-  const referencesClean = references.map((reference) => reference.replace(/^\.\//, ''));
-  const bundleRefs = [];
-  for (const reference of referencesClean) {
-    const rewrite = rewrites.find((item) => item.from === reference);
-    const effective = rewrite ? rewrite.to : reference;
-    if (!/^(?:https?:)?\/\//i.test(effective) && !effective.startsWith('/')) bundleRefs.push(effective);
-  }
-  const referenceByBase = new Map();
-  for (const reference of bundleRefs) {
-    const base = reference.split('/').pop();
-    if (base && !referenceByBase.has(base)) referenceByBase.set(base, reference);
-  }
-  const selected = files.filter((file) => file !== source).map((file) => {
-    const parts = importFileName(file.relativePath || file.name);
-    const relativeParts = sourceDirectory && parts.slice(0, sourceParts.length - 1).join('/') === sourceDirectory ? parts.slice(sourceParts.length - 1) : parts;
-    let targetParts = relativeParts;
-    const joined = relativeParts.join('/');
-    if (!bundleRefs.includes(joined) && relativeParts.length === 1 && referenceByBase.has(relativeParts[0])) targetParts = referenceByBase.get(relativeParts[0]).split('/');
-    return { ...file, parts, targetParts };
-  });
-  const selectedNames = new Set();
-  for (const file of selected) { selectedNames.add(file.parts.join('/')); selectedNames.add(file.parts.at(-1)); selectedNames.add(file.targetParts.join('/')); }
-  for (const asset of diskAssets) selectedNames.add(asset.targetParts.join('/'));
-  const missing = bundleRefs.filter((reference) => !selectedNames.has(reference) && !selectedNames.has(reference.split('/').pop()));
-  // Windows 文件系统大小写不敏感；在导入确认阶段就拦截两个输入归到同一
-  // 个目标路径的情况，避免后写入的图片覆盖先写入的图片。
-  const uniqueAssets = [];
-  const assetTargets = new Map();
-  for (const asset of [...selected, ...diskAssets]) {
-    const targetParts = Array.isArray(asset.targetParts) ? asset.targetParts : [];
-    const targetKey = targetParts.join('/').replaceAll('\\', '/').toLowerCase();
-    if (!targetKey || targetKey === 'index.md') continue;
-    const previous = assetTargets.get(targetKey);
-    if (previous) {
-      const sameDiskFile = previous.diskPath && asset.diskPath && path.resolve(previous.diskPath) === path.resolve(asset.diskPath);
-      if (sameDiskFile) continue;
-      throw httpError(409, `导入资源同名冲突：${targetParts.join('/')}。请重命名后再导入。`);
-    }
-    assetTargets.set(targetKey, asset);
-    uniqueAssets.push(asset);
-  }
-  const changes = [];
-  const content = parsed.rawFrontMatter ? rewritten : `---\ntitle: ${formatYamlValue(title)}\ndate: ${new Date().toISOString()}\nlastmod: ${new Date().toISOString()}\nslug: ${formatYamlValue(slug)}\nsummary: ""\ntags: []\ncategories: []\ndraft: ${request.draft === false ? 'false' : 'true'}\n---\n\n${rewritten}`;
-  return { slug, title, raw: content, hasFrontMatter: Boolean(parsed.rawFrontMatter), sourceDirectory, assets: uniqueAssets, references, missing, rewrites, staticCopies, changes };
-}
-
-function safeSlug(input) {
-  const slug = String(input || '').trim().replace(/\s+/g, '-');
-  if (!slug || slug.length > 100 || /[\\/:*?"<>|]/.test(slug) || slug === '.' || slug === '..' || slug.includes('..')) return null;
-  return slug;
-}
+const { atomicWrite, atomicCreate, copyWithoutClobber } = createAtomicFileService({
+  scheduleBuild,
+  httpError,
+  relativeToRepo,
+});
 
 async function handleApi(req, res, url) {
   const pathname = url.pathname;
@@ -1464,7 +1177,7 @@ async function handleApi(req, res, url) {
   }
   if (req.method === 'GET' && pathname === '/api/posts') return send(res, 200, { posts: await listPosts() });
   if (req.method === 'GET' && pathname === '/api/admin/export') {
-    const archive = await lilymapSourceArchive();
+    const archive = await createLilyMapSourceArchive({ repoRoot, adminDir });
     res.writeHead(200, { 'content-type': 'application/gzip', 'content-disposition': 'attachment; filename="lilymap-source.tar.gz"', 'content-length': archive.length, 'cache-control': 'no-store' });
     res.end(archive);
     return;
@@ -1946,7 +1659,7 @@ async function handleApi(req, res, url) {
     const result = await git(args); return send(res, 200, { diff: result.stdout || result.stderr, code: result.code });
   }
   if (req.method === 'POST' && pathname === '/api/build') {
-    if (buildTimer) { clearTimeout(buildTimer); buildTimer = null; }
+    cancelScheduledBuild();
     const result = await runBuild(true, 'manual');
     return send(res, result.code === 0 ? 200 : 500, {
       ok: result.code === 0,
@@ -2040,49 +1753,6 @@ async function handleApi(req, res, url) {
   return fail(res, 404, '未知 API。');
 }
 
-const mime = {
-  '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.css': 'text/css; charset=utf-8',
-  '.json': 'application/json; charset=utf-8', '.xml': 'application/xml; charset=utf-8', '.txt': 'text/plain; charset=utf-8',
-  '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.webp': 'image/webp', '.gif': 'image/gif',
-  '.svg': 'image/svg+xml', '.avif': 'image/avif', '.ico': 'image/x-icon',
-  '.woff': 'font/woff', '.woff2': 'font/woff2', '.ttf': 'font/ttf',
-  '.mp3': 'audio/mpeg', '.mp4': 'video/mp4', '.webm': 'video/webm', '.pdf': 'application/pdf',
-};
-
-async function streamFile(req, res, target, headers = {}) {
-  const stat = await fs.stat(target);
-  const common = {
-    'content-type': mime[path.extname(target)] || 'application/octet-stream',
-    'content-length': stat.size,
-    'accept-ranges': 'bytes',
-    ...headers,
-  };
-  const match = String(req.headers.range || '').match(/^bytes=(\d*)-(\d*)$/);
-  if (match) {
-    let start = match[1] ? Number(match[1]) : NaN;
-    let end = match[2] ? Number(match[2]) : NaN;
-    if (!Number.isFinite(start) && Number.isFinite(end)) {
-      start = Math.max(0, stat.size - end);
-      end = stat.size - 1;
-    } else {
-      if (!Number.isFinite(start)) start = 0;
-      if (!Number.isFinite(end)) end = stat.size - 1;
-    }
-    if (start < 0 || end < start || start >= stat.size) {
-      res.writeHead(416, { ...common, 'content-range': `bytes */${stat.size}`, 'content-length': 0 });
-      res.end();
-      return;
-    }
-    end = Math.min(end, stat.size - 1);
-    res.writeHead(206, { ...common, 'content-range': `bytes ${start}-${end}/${stat.size}`, 'content-length': end - start + 1 });
-    if (req.method === 'HEAD') return res.end();
-    fsSync.createReadStream(target, { start, end }).pipe(res);
-    return;
-  }
-  res.writeHead(200, common);
-  if (req.method === 'HEAD') return res.end();
-  fsSync.createReadStream(target).pipe(res);
-}
 // 打包后 public 位于 exe 快照；源码模式从 tools/admin/public 读取。最后一个候选
 // 兼容旧版便携包，便于仍与源码项目放在一起的用户完成升级。
 const publicCandidates = [publicRoot, path.join(repoRoot, 'tools', 'admin', 'public')].filter(Boolean);
