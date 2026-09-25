@@ -8,6 +8,7 @@ import { fileURLToPath } from 'node:url';
 import { networkInterfaces } from 'node:os';
 import { resolveInside } from './src/fs/path-security.mjs';
 import { createAtomicFileService } from './src/fs/atomic-files.mjs';
+import { createFileTransactionService } from './src/fs/file-transaction.mjs';
 import { createLilyMapSourceArchive } from './src/services/source-archive.mjs';
 import { createBuildService } from './src/services/build-service.mjs';
 import { createImportPlanner } from './src/services/import-planner.mjs';
@@ -388,10 +389,13 @@ async function installSiteModule(request) {
   for (const file of manifest.assets.scripts || []) if (file !== scriptPath) throw new Error(`JS 必须命名为 ${scriptPath}。`);
   if ((manifest.assets.styles || []).includes(stylePath) && typeof request.style !== 'string') throw new Error('manifest 声明了 CSS，但未提供样式内容。');
   if ((manifest.assets.scripts || []).includes(scriptPath) && typeof request.script !== 'string') throw new Error('manifest 声明了 JS，但未提供脚本内容。');
-  await atomicWrite(path.join(userModulesRoot, `${id}.yaml`), rawManifest);
-  await atomicWrite(path.join(repoRoot, 'layouts', 'partials', manifest.template.partial), request.template);
-  if ((manifest.assets.styles || []).includes(stylePath)) await atomicWrite(path.join(repoRoot, 'assets', stylePath), request.style);
-  if ((manifest.assets.scripts || []).includes(scriptPath)) await atomicWrite(path.join(repoRoot, 'assets', scriptPath), request.script);
+  const files = [
+    { target: path.join(userModulesRoot, `${id}.yaml`), content: rawManifest },
+    { target: path.join(repoRoot, 'layouts', 'partials', manifest.template.partial), content: request.template },
+  ];
+  if ((manifest.assets.styles || []).includes(stylePath)) files.push({ target: path.join(repoRoot, 'assets', stylePath), content: request.style });
+  if ((manifest.assets.scripts || []).includes(scriptPath)) files.push({ target: path.join(repoRoot, 'assets', scriptPath), content: request.script });
+  await fileTransaction.replaceFiles(files);
   return { id, manifest };
 }
 
@@ -887,10 +891,16 @@ const {
   maxOutputBytes: 16 * 1024,
 });
 
-const { atomicWrite, atomicCreate, copyWithoutClobber } = createAtomicFileService({
+const { stageFile, atomicWrite, atomicCreate, copyWithoutClobber } = createAtomicFileService({
   scheduleBuild,
   httpError,
   relativeToRepo,
+});
+
+const fileTransaction = createFileTransactionService({
+  stageFile,
+  atomicWrite,
+  scheduleBuild,
 });
 
 const publishService = createPublishService({
@@ -1001,9 +1011,10 @@ async function handleApi(req, res, url) {
     for (const [key, value] of Object.entries(profile)) document.set(key, value);
     const tomlPath = path.join(repoRoot, 'hugo.toml');
     const toml = await fs.readFile(tomlPath, 'utf8');
-    await atomicWrite(siteDataFile, String(document), { schedule: false });
-    await atomicWrite(tomlPath, patchTomlValue(toml, 'params.author', profile.author), { schedule: false });
-    scheduleBuild();
+    await fileTransaction.replaceFiles([
+      { target: siteDataFile, content: String(document) },
+      { target: tomlPath, content: patchTomlValue(toml, 'params.author', profile.author) },
+    ]);
     return send(res, 200, { ok: true, ...await readProfile() });
   }
   if (req.method === 'PUT' && pathname === '/api/friends') {
@@ -1321,12 +1332,14 @@ async function handleApi(req, res, url) {
     const schema = JSON.parse(await fs.readFile(path.join(themeRoot, 'theme-config.schema.json'), 'utf8'));
     const values = validateThemeSettingsPatch(schema, request.values || {});
     const menus = request.menus === undefined ? null : validateMenus(request.menus);
-    let raw = await fs.readFile(path.join(repoRoot, 'hugo.toml'), 'utf8');
+    const tomlPath = path.join(repoRoot, 'hugo.toml');
+    let raw = await fs.readFile(tomlPath, 'utf8');
     for (const [fieldPath, value] of Object.entries(values)) raw = patchTomlValue(raw, fieldPath, value);
     if (menus) raw = patchMenus(raw, menus);
-    await atomicWrite(path.join(repoRoot, 'hugo.toml'), raw);
-    // The about page renders the avatar from data/site.yaml (hugo.Data.site),
-    // so keep it in sync whenever params.avatar changes.
+
+    const files = [{ target: tomlPath, content: raw }];
+    // The about page renders identity from data/site.yaml, so keep linked values
+    // in one transaction with hugo.toml instead of allowing a half-updated site.
     const hasAvatar = Object.hasOwn(values, 'params.avatar');
     const hasAuthor = Object.hasOwn(values, 'params.author');
     if (hasAvatar || hasAuthor) {
@@ -1335,9 +1348,10 @@ async function handleApi(req, res, url) {
       if (document.errors.length) throw httpError(400, `站点数据 YAML 无效：${document.errors[0].message}`);
       if (hasAvatar) document.set('avatar', values['params.avatar']);
       if (hasAuthor) document.set('author', values['params.author']);
-      await atomicWrite(siteDataFile, String(document));
+      files.push({ target: siteDataFile, content: String(document) });
     }
-    scheduleBuild();
+
+    await fileTransaction.replaceFiles(files);
     return send(res, 200, { ok: true, ...parseToml(raw) });
   }
   if (req.method === 'PUT' && pathname === '/api/settings') {
