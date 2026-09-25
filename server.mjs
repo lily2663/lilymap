@@ -11,6 +11,7 @@ import { createAtomicFileService } from './src/fs/atomic-files.mjs';
 import { createLilyMapSourceArchive } from './src/services/source-archive.mjs';
 import { createBuildService } from './src/services/build-service.mjs';
 import { createImportPlanner } from './src/services/import-planner.mjs';
+import { createGitService } from './src/services/git-service.mjs';
 import { safeSlug } from './src/domain/slug.mjs';
 import YAML from 'yaml';
 import { formatYamlValue, parseFrontMatter, patchFrontMatter } from './src/domain/front-matter.mjs';
@@ -23,7 +24,7 @@ import { validateMenus, validateThemeSettingsPatch } from './src/domain/theme-co
 import { createHttpPrimitives } from './src/http/primitives.mjs';
 import { streamFile } from './src/http/static-files.mjs';
 import { updateModulePlacement } from './src/domain/module-config.mjs';
-import { isSensitivePublishPath, publishPushArguments, redactGitCredentials, validatePublishToken } from './src/domain/publish-security.mjs';
+import { isSensitivePublishPath, publishPushArguments, validatePublishToken } from './src/domain/publish-security.mjs';
 
 // esbuild 打包成 cjs 后 __dirname 可用；dev 模式（node 直接跑 ESM）下 __dirname 不存在，
 // 用 import.meta.url 兜底推导。
@@ -650,36 +651,7 @@ async function uninstallSiteModule(id) {
 
 function versionFor(raw, stat) { return `${stat.size}:${createHash('sha256').update(raw).digest('hex').slice(0, 16)}`; }
 
-function gitEnvironment(config = []) {
-  const env = { ...process.env, GIT_TERMINAL_PROMPT: '0' };
-  for (const key of Object.keys(env)) {
-    if (key === 'GIT_CONFIG_COUNT' || /^GIT_CONFIG_(?:KEY|VALUE)_\d+$/.test(key)) delete env[key];
-  }
-  if (config.length) {
-    env.GIT_CONFIG_COUNT = String(config.length);
-    config.forEach(([key, value], index) => {
-      env[`GIT_CONFIG_KEY_${index}`] = String(key);
-      env[`GIT_CONFIG_VALUE_${index}`] = String(value);
-    });
-  }
-  return env;
-}
-
-async function git(args, config = []) {
-  return new Promise((resolve) => {
-    const child = spawn('git', args, {
-      cwd: repoRoot,
-      windowsHide: true,
-      shell: false,
-      env: gitEnvironment(config),
-    });
-    let stdout = ''; let stderr = '';
-    child.stdout.on('data', (data) => { stdout += data; });
-    child.stderr.on('data', (data) => { stderr += data; });
-    child.on('close', (code) => resolve({ code, stdout, stderr }));
-    child.on('error', (error) => resolve({ code: 1, stdout, stderr: error.message }));
-  });
-}
+const { git, gitNetwork, systemGitProxy, safeGitFailure, gitChanges } = createGitService({ repoRoot });
 
 function runLocalCommand(command, args) {
   return new Promise((resolve) => {
@@ -819,67 +791,6 @@ async function importWallpaperMedia(sourcePath, targetName) {
     ok: true, kind, path: publicPathForRepoFile(destination), file: relativeToRepo(destination),
     sourceSize: stat.size, outputSize: outputStat.size, optimized: true, input, output, poster, ...preview,
   };
-}
-
-let systemProxyCache;
-async function systemGitProxy() {
-  if (systemProxyCache !== undefined) return systemProxyCache;
-  const environmentProxy = process.env.HTTPS_PROXY || process.env.https_proxy || process.env.HTTP_PROXY || process.env.http_proxy;
-  if (environmentProxy) {
-    try {
-      const parsed = new URL(environmentProxy);
-      if (/^https?:$/.test(parsed.protocol) && parsed.hostname) return (systemProxyCache = parsed.href);
-    } catch {}
-  }
-  if (process.platform !== 'win32') return (systemProxyCache = '');
-  const registryKey = 'HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings';
-  const [enabled, configured] = await Promise.all([
-    runLocalCommand('reg.exe', ['query', registryKey, '/v', 'ProxyEnable']),
-    runLocalCommand('reg.exe', ['query', registryKey, '/v', 'ProxyServer']),
-  ]);
-  if (enabled.code !== 0 || configured.code !== 0 || !/ProxyEnable\s+REG_DWORD\s+0x1\b/i.test(enabled.stdout)) return (systemProxyCache = '');
-  const raw = configured.stdout.match(/ProxyServer\s+REG_SZ\s+(.+)$/im)?.[1]?.trim() || '';
-  const entries = raw.split(';').map((entry) => entry.trim()).filter(Boolean);
-  const selected = entries.find((entry) => /^https=/i.test(entry)) || entries.find((entry) => /^http=/i.test(entry)) || entries[0] || '';
-  const address = selected.replace(/^[a-z]+=/i, '');
-  if (!address || /[\r\n]/.test(address)) return (systemProxyCache = '');
-  const normalized = /^[a-z]+:\/\//i.test(address) ? address : `http://${address}`;
-  try {
-    const parsed = new URL(normalized);
-    if (!/^https?:$/.test(parsed.protocol) || !parsed.hostname) return (systemProxyCache = '');
-    return (systemProxyCache = parsed.href);
-  } catch { return (systemProxyCache = ''); }
-}
-
-function isTransientGitNetworkFailure(result) {
-  return /failed to connect|could not resolve|connection (?:was )?reset|timed? out|tls connect|http\/2 stream|schannel/i.test(`${result.stderr}\n${result.stdout}`);
-}
-
-async function gitNetwork(args, config = []) {
-  const proxy = await systemGitProxy();
-  const transport = proxy ? [['http.proxy', proxy]] : [];
-  let result = await git(args, [...transport, ...config]);
-  if (result.code !== 0 && isTransientGitNetworkFailure(result)) {
-    result = await git(args, [['http.version', 'HTTP/1.1'], ...transport, ...config]);
-    result.retried = true;
-  }
-  result.proxyDetected = Boolean(proxy);
-  return result;
-}
-
-function safeGitFailure(result, token = '') {
-  const detail = redactGitCredentials(result.stderr || result.stdout, token);
-  if (isTransientGitNetworkFailure(result)) {
-    const route = result.proxyDetected ? '已读取 Windows 系统代理并重试一次' : '未检测到可用系统代理，已用 HTTP/1.1 重试一次';
-    return `无法连接 GitHub 主站（${route}）。请确认代理正在运行后再点发布。`;
-  }
-  if (/authentication failed|invalid username or password|403|401/i.test(detail)) return 'GitHub 认证失败，请更新博客根目录的 .token。';
-  return detail.slice(0, 800);
-}
-
-async function gitChanges() {
-  const result = await git(['-c', 'core.quotepath=false', 'status', '--short']);
-  return result.stdout.split(/\r?\n/).filter(Boolean).map((line) => ({ status: line.slice(0, 2).trim() || '??', path: line.slice(3).trim().replaceAll('\\', '/') }));
 }
 
 const localConfigFile = path.join(repoRoot, '.lilymap-local.json');
