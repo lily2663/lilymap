@@ -7,6 +7,7 @@ import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { gzipSync } from 'node:zlib';
 import { networkInterfaces } from 'node:os';
+import { resolveInside } from './src/fs/path-security.mjs';
 import YAML from 'yaml';
 import { formatYamlValue, parseFrontMatter, patchFrontMatter } from './src/domain/front-matter.mjs';
 import { parseToml, patchMenus, patchTomlValue } from './src/domain/toml.mjs';
@@ -206,14 +207,17 @@ function previewSnapshot() {
 }
 
 function inside(root, candidate) {
-  const target = path.resolve(root, candidate);
-  return target === root || target.startsWith(`${root}${path.sep}`) ? target : null;
+  return resolveInside(root, candidate);
 }
 
 function repoPath(relative, allowedRoots = [contentRoot]) {
   if (!relative || path.isAbsolute(relative)) return null;
   const target = path.resolve(repoRoot, relative);
-  return allowedRoots.some((root) => target === root || target.startsWith(`${root}${path.sep}`)) ? target : null;
+  for (const root of allowedRoots) {
+    const resolved = inside(root, path.relative(root, target));
+    if (resolved) return resolved;
+  }
+  return null;
 }
 
 function managedResourcePath(relative) {
@@ -320,8 +324,10 @@ async function lilymapSourceArchive() {
     'src/domain/publish-security.mjs',
     'src/domain/theme-config.mjs',
     'src/http/primitives.mjs',
+    'src/fs/path-security.mjs',
     'test/domain.test.mjs',
     'test/http.test.mjs',
+    'test/path-security.test.mjs',
     'test/module-config-http.test.mjs',
     'test/publish-security.test.mjs',
     'test/publish-token-http.test.mjs',
