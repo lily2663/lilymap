@@ -1,13 +1,21 @@
 import path from 'node:path';
-import { spawn } from 'node:child_process';
+
+import { createProcessRunner } from './process-runner.mjs';
 
 export function createBuildService({
   repoRoot,
   hugoExecutable,
   maxOutputBytes = 16 * 1024,
-  spawnProcess = spawn,
+  buildTimeoutMs = 120_000,
+  spawnProcess,
+  processRunner,
   onError = (message) => console.error(message),
 }) {
+  const runner = processRunner || createProcessRunner({
+    ...(spawnProcess ? { spawnProcess } : {}),
+    defaultTimeoutMs: buildTimeoutMs,
+    defaultMaxOutputBytes: maxOutputBytes,
+  });
   const state = {
     status: 'idle',
     trigger: '',
@@ -55,25 +63,20 @@ export function createBuildService({
       ? ['--gc', '--minify', '--cacheDir', path.join(repoRoot, '.cache', 'hugo')]
       : ['--cacheDir', path.join(repoRoot, '.cache', 'hugo')];
 
-    return new Promise((resolve) => {
-      let settled = false;
-      const finish = (result) => {
-        if (settled) return;
-        settled = true;
-        resolve(result);
-      };
-      const child = spawnProcess(hugoExecutable, args, { cwd: repoRoot, windowsHide: true, shell: false });
-      let output = '';
-      child.stdout?.on('data', (data) => { output += data; });
-      child.stderr?.on('data', (data) => { output += data; });
-      child.on('close', (code) => finish({ code: Number.isInteger(code) ? code : 1, output }));
-      child.on('error', (error) => finish({
-        code: 1,
-        output: error.message === 'spawn hugo ENOENT'
-          ? '未找到 Hugo。请安装 Hugo，或在 lilymap.json 中设置 hugoPath。'
-          : error.message,
-      }));
+    const result = await runner.run(hugoExecutable, args, {
+      cwd: repoRoot,
+      timeoutMs: buildTimeoutMs,
+      maxOutputBytes,
     });
+    let output = result.output || result.stderr || result.stdout || result.error || '';
+    if (/spawn hugo ENOENT/i.test(result.error || result.stderr || '')) {
+      output = '未找到 Hugo。请安装 Hugo，或在 lilymap.json 中设置 hugoPath。';
+    } else if (result.timedOut) {
+      output = `Hugo 构建超过 ${Math.ceil(buildTimeoutMs / 1000)} 秒，已终止。`;
+    } else if (result.aborted) {
+      output = 'Hugo 构建已取消。';
+    }
+    return { code: result.code, output };
   }
 
   async function runBuild(minify = false, trigger = 'manual') {
