@@ -17,6 +17,8 @@ import { createGitService } from './src/services/git-service.mjs';
 import { createPublishService } from './src/services/publish-service.mjs';
 import { createSiteSettingsService } from './src/services/site-settings-service.mjs';
 import { createMediaService, mediaKind as classifyMedia } from './src/services/media-service.mjs';
+import { createNetworkAdapter } from './src/services/network-adapter.mjs';
+import { createNeteaseService } from './src/services/netease-service.mjs';
 import { safeSlug } from './src/domain/slug.mjs';
 import YAML from 'yaml';
 import { formatYamlValue, parseFrontMatter, patchFrontMatter } from './src/domain/front-matter.mjs';
@@ -378,241 +380,6 @@ async function installSiteModule(request) {
   return { id, manifest };
 }
 
-async function readResponseTextLimited(response, limit) {
-  const declared = Number(response.headers.get('content-length') || 0);
-  if (Number.isFinite(declared) && declared > limit) throw new Error('远程服务返回内容过大，已停止读取。');
-  if (!response.body) return '';
-  const chunks = [];
-  let size = 0;
-  for await (const chunk of response.body) {
-    const bytes = Buffer.from(chunk);
-    size += bytes.length;
-    if (size > limit) throw new Error('远程服务返回内容过大，已停止读取。');
-    chunks.push(bytes);
-  }
-  return Buffer.concat(chunks).toString('utf8');
-}
-
-async function importNeteasePlaylist(request) {
-  const playlistInput = String(request?.playlistId || '').trim();
-  let playlistId = playlistInput;
-  if (/^https?:\/\//i.test(playlistInput)) {
-    let parsed;
-    try { parsed = new URL(playlistInput); } catch { throw new Error('歌单链接格式无效。'); }
-    if (!['music.163.com', 'y.music.163.com'].includes(parsed.hostname.toLowerCase())) throw new Error('只支持网易云音乐歌单链接。');
-    playlistId = parsed.searchParams.get('id') || parsed.hash.match(/[?&]id=(\d+)/)?.[1] || '';
-  }
-  if (!/^\d{5,20}$/.test(playlistId)) throw new Error('请输入正确的网易云歌单 ID。');
-  const cookie = String(request?.cookie || '').trim().replace(/^cookie\s*:\s*/i, '').replace(/\\([_*])/g, '$1');
-  if (cookie.length > 8192 || /[\r\n\0]/.test(cookie)) throw new Error('Cookie 格式无效。');
-
-  let response;
-  try {
-    response = await fetch(`https://music.163.com/api/v6/playlist/detail?id=${encodeURIComponent(playlistId)}&n=1000&s=0`, {
-      headers: {
-        accept: 'application/json, text/plain, */*',
-        cookie,
-        referer: `https://music.163.com/playlist?id=${encodeURIComponent(playlistId)}`,
-        'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 LilyMap/1.0',
-      },
-      redirect: 'manual',
-      signal: AbortSignal.timeout(20000),
-    });
-  } catch {
-    throw new Error('连接网易云超时，请检查网络后重试。');
-  }
-  if (response.status >= 300 && response.status < 400) throw new Error('网易云接口返回了重定向；为避免登录 Cookie 被转发到其他地址，已停止导入。');
-  if (!response.ok) throw new Error(`网易云返回 HTTP ${response.status}，请稍后重试。`);
-
-  let payload;
-  try { payload = JSON.parse(await readResponseTextLimited(response, 8 * 1024 * 1024)); }
-  catch (error) {
-    if (/内容过大/.test(error.message)) throw error;
-    throw new Error('网易云返回了无法识别的数据。');
-  }
-  const playlist = payload?.playlist || payload?.result;
-  if (!playlist || !Array.isArray(playlist.tracks)) {
-    if (payload?.code === 401 || payload?.code === 20001) {
-      throw new Error(cookie
-        ? '网易云拒绝访问这个隐私歌单。当前 Cookie 未获得访问权限或已经过期，请在网易云重新登录后复制完整 Cookie。原有歌单快照不会被覆盖。'
-        : '这是隐私歌单。请填写有访问权限且仍有效的网易云登录 Cookie，或把歌单设为公开。原有歌单快照仍可使用。');
-    }
-    throw new Error(String(payload?.message || payload?.msg || '没有读取到歌单；请检查歌单 ID 与 Cookie。').slice(0, 180));
-  }
-
-  const tracks = playlist.tracks.slice(0, 500).map((track) => {
-    const id = String(track?.id || '').trim();
-    const artists = track?.ar || track?.artists || [];
-    const album = track?.al || track?.album || {};
-    return {
-      id,
-      title: String(track?.name || '未命名音乐').slice(0, 160),
-      artist: artists.map((artist) => String(artist?.name || '')).filter(Boolean).join(' / ').slice(0, 200),
-      album: String(album?.name || '').slice(0, 160),
-      cover: String(album?.picUrl || '').replace(/^http:/i, 'https:').slice(0, 1000),
-      duration: Number(track?.dt || track?.duration || 0),
-      source: `https://music.163.com/song/media/outer/url?id=${encodeURIComponent(id)}.mp3`,
-    };
-  }).filter((track) => /^\d{1,20}$/.test(track.id));
-  if (!tracks.length) throw new Error('歌单中没有可导入的歌曲。');
-
-  const snapshot = {
-    provider: 'netease',
-    playlistId,
-    name: String(playlist.name || `网易云歌单 ${playlistId}`).slice(0, 160),
-    cover: String(playlist.coverImgUrl || '').replace(/^http:/i, 'https:').slice(0, 1000),
-    importedAt: new Date().toISOString(),
-    tracks,
-  };
-  const target = inside(path.join(repoRoot, 'data', 'lily', 'music'), `p${playlistId}.yaml`);
-  if (!target) throw new Error('歌单保存路径无效。');
-  if (await exists(target)) {
-    const previous = parseYaml(await fs.readFile(target, 'utf8'), `歌单 ${playlistId}`);
-    const availableIds = new Set(tracks.map((track) => track.id));
-    snapshot.excludedTrackIds = Array.isArray(previous.excludedTrackIds)
-      ? previous.excludedTrackIds.map(String).filter((id) => availableIds.has(id))
-      : [];
-  }
-  await atomicWrite(target, YAML.stringify(snapshot), { schedule: false });
-  const activated = request?.activate === true;
-  if (activated) await activateNeteasePlaylist(playlistId, { build: false });
-  const build = await runBuild(false, 'netease-playlist');
-  if (build.code !== 0) throw new Error(`歌单已保存${activated ? '并设为当前歌单' : ''}，但博客构建失败：${build.output || '请查看系统诊断。'}`);
-  return { playlistId, name: snapshot.name, trackCount: tracks.length, path: relativeToRepo(target), activated, build: build.build };
-}
-
-async function activeNeteasePlaylistId() {
-  const target = path.join(userLayoutsRoot, 'home.yaml');
-  const source = await exists(target) ? target : path.join(builtInLayoutsRoot, 'home.yaml');
-  if (!(await exists(source))) return '';
-  const layout = parseLayout(await fs.readFile(source, 'utf8'), '首页布局');
-  for (const instances of Object.values(layout.slots)) {
-    const music = instances.find((instance) => instance.module === 'music' && instance.enabled !== false);
-    if (music) return String(music.config?.playlistId || '');
-  }
-  return '';
-}
-
-async function activateNeteasePlaylist(rawPlaylistId, { build = true } = {}) {
-  const playlistId = String(rawPlaylistId || '').trim();
-  if (!/^\d{5,20}$/.test(playlistId)) throw new Error('请输入正确的网易云歌单 ID。');
-  const snapshot = inside(path.join(repoRoot, 'data', 'lily', 'music'), `p${playlistId}.yaml`);
-  if (!snapshot || !(await exists(snapshot))) throw new Error('该歌单尚未导入，请先同步歌单。');
-  const target = path.join(userLayoutsRoot, 'home.yaml');
-  const source = await exists(target) ? target : path.join(builtInLayoutsRoot, 'home.yaml');
-  if (!(await exists(source))) throw new Error('未找到首页布局，请先在页面布局中添加 Lily Radio。');
-  const document = YAML.parseDocument(await fs.readFile(source, 'utf8'), { prettyErrors: true, uniqueKeys: true });
-  if (document.errors.length) throw new Error(`首页布局 YAML 无效：${document.errors[0].message}`);
-  const layout = normalizeLayout(document.toJS({ mapAsMap: false }), '首页布局');
-  const instances = Object.entries(layout.slots).flatMap(([slot, items]) => items.map((item, index) => ({ slot, item, index })));
-  const music = instances.filter(({ item }) => item.module === 'music' && item.enabled !== false);
-  if (!music.length) throw new Error('首页没有启用的 Lily Radio；请先在页面布局中添加模块。');
-  const previousPlaylistId = String(music[0].item.config?.playlistId || '');
-  for (const { slot, index } of music) document.setIn(['slots', slot, index, 'config', 'playlistId'], playlistId);
-  const updated = parseLayout(String(document), '首页布局');
-  validateLayoutAgainstRegistry(updated, await loadModuleRegistry());
-  if (await exists(target)) await snapshotLayout('home', target);
-  await atomicWrite(target, String(document), { schedule: false });
-  if (build) {
-    const result = await runBuild(false, 'netease-activate');
-    if (result.code !== 0) throw new Error(`歌单已设为当前歌单，但博客构建失败：${result.output || '请查看系统诊断。'}`);
-  }
-  return { playlistId, previousPlaylistId, active: true };
-}
-
-async function neteaseSnapshotStatus(rawPlaylistId) {
-  const playlistId = String(rawPlaylistId || '').trim();
-  if (!/^\d{5,20}$/.test(playlistId)) throw new Error('请输入正确的网易云歌单 ID。');
-  const activePlaylistId = await activeNeteasePlaylistId();
-  const target = inside(path.join(repoRoot, 'data', 'lily', 'music'), `p${playlistId}.yaml`);
-  if (!target || !(await exists(target))) return { exists: false, playlistId, trackCount: 0, activePlaylistId, active: playlistId === activePlaylistId };
-  const snapshot = parseYaml(await fs.readFile(target, 'utf8'), `歌单 ${playlistId}`);
-  const stat = await fs.stat(target);
-  const trackCount = Array.isArray(snapshot.tracks) ? snapshot.tracks.length : 0;
-  const excludedCount = Array.isArray(snapshot.excludedTrackIds) ? snapshot.excludedTrackIds.length : 0;
-  return {
-    exists: true,
-    playlistId,
-    activePlaylistId,
-    active: playlistId === activePlaylistId,
-    name: String(snapshot.name || `网易云歌单 ${playlistId}`).slice(0, 160),
-    trackCount,
-    excludedCount,
-    playableCount: Math.max(0, trackCount - excludedCount),
-    importedAt: snapshot.importedAt || stat.mtime.toISOString(),
-    path: relativeToRepo(target),
-  };
-}
-
-async function neteaseSnapshotTracks(rawPlaylistId) {
-  const playlistId = String(rawPlaylistId || '').trim();
-  if (!/^\d{5,20}$/.test(playlistId)) throw new Error('请输入正确的网易云歌单 ID。');
-  const target = inside(path.join(repoRoot, 'data', 'lily', 'music'), `p${playlistId}.yaml`);
-  if (!target || !(await exists(target))) throw new Error('该歌单尚未导入。');
-  const snapshot = parseYaml(await fs.readFile(target, 'utf8'), `歌单 ${playlistId}`);
-  if (!Array.isArray(snapshot.tracks)) throw new Error('歌单快照缺少歌曲列表。');
-  const excludedTrackIds = Array.isArray(snapshot.excludedTrackIds) ? snapshot.excludedTrackIds.map(String) : [];
-  return {
-    playlistId,
-    name: String(snapshot.name || `网易云歌单 ${playlistId}`),
-    tracks: snapshot.tracks.map((track) => ({ id: String(track.id), title: String(track.title || ''), artist: String(track.artist || '') })),
-    excludedTrackIds,
-  };
-}
-
-async function checkNeteaseTrackAvailability(request) {
-  const snapshot = await neteaseSnapshotTracks(request?.playlistId);
-  const trackIds = request?.trackIds;
-  if (!Array.isArray(trackIds) || trackIds.length < 1 || trackIds.length > 8) throw new Error('每次只能检测 1–8 首歌曲。');
-  const known = new Set(snapshot.tracks.map((track) => track.id));
-  if (!trackIds.every((id) => typeof id === 'string' && known.has(id))) throw new Error('检测列表包含不属于该歌单的歌曲。');
-  const results = await Promise.all(trackIds.map(async (id) => {
-    try {
-      const response = await fetch(`https://music.163.com/song/media/outer/url?id=${encodeURIComponent(id)}.mp3`, {
-        method: 'HEAD',
-        redirect: 'follow',
-        signal: AbortSignal.timeout(10000),
-      });
-      const type = String(response.headers.get('content-type') || '').toLowerCase();
-      const state = response.ok && type.startsWith('audio/') ? 'playable'
-        : response.url.includes('/404') || type.includes('text/html') || response.status === 404 ? 'unavailable'
-          : 'unknown';
-      return { id, state };
-    } catch { return { id, state: 'unknown' }; }
-  }));
-  return { playlistId: snapshot.playlistId, results };
-}
-
-async function saveNeteaseExclusions(request) {
-  const snapshot = await neteaseSnapshotTracks(request?.playlistId);
-  const ids = request?.excludedTrackIds;
-  if (!Array.isArray(ids) || ids.length > 500 || !ids.every((id) => typeof id === 'string')) throw new Error('剔除列表格式无效。');
-  const known = new Set(snapshot.tracks.map((track) => track.id));
-  const excludedTrackIds = [...new Set(ids)];
-  if (!excludedTrackIds.every((id) => known.has(id))) throw new Error('剔除列表包含不属于该歌单的歌曲。');
-  if (excludedTrackIds.length >= snapshot.tracks.length) throw new Error('请至少保留一首歌曲供博客播放。');
-  const target = inside(path.join(repoRoot, 'data', 'lily', 'music'), `p${snapshot.playlistId}.yaml`);
-  const document = YAML.parseDocument(await fs.readFile(target, 'utf8'), { prettyErrors: true, uniqueKeys: true });
-  if (document.errors.length) throw new Error(`歌单 YAML 无效：${document.errors[0].message}`);
-  document.set('excludedTrackIds', excludedTrackIds);
-  await atomicWrite(target, String(document), { schedule: false });
-  const build = await runBuild(false, 'netease-exclusions');
-  if (build.code !== 0) throw new Error(`剔除设置已保存，但博客构建失败：${build.output || '请查看系统诊断。'}`);
-  return { playlistId: snapshot.playlistId, total: snapshot.tracks.length, excludedCount: excludedTrackIds.length, playableCount: snapshot.tracks.length - excludedTrackIds.length };
-}
-
-async function listNeteaseSnapshots() {
-  const root = path.join(repoRoot, 'data', 'lily', 'music');
-  const activePlaylistId = await activeNeteasePlaylistId();
-  const files = (await yamlFiles(root)).filter((file) => /^p\d{5,20}\.yaml$/.test(path.basename(file)));
-  const playlists = await Promise.all(files.map(async (file) => {
-    const playlistId = path.basename(file).slice(1, -5);
-    return neteaseSnapshotStatus(playlistId);
-  }));
-  playlists.sort((a, b) => String(b.importedAt || '').localeCompare(String(a.importedAt || '')));
-  return { activePlaylistId, playlists };
-}
-
 async function uninstallSiteModule(id) {
   const registry = await loadModuleRegistry(); const manifest = registry[id];
   if (!manifest) throw new Error('模块不存在。');
@@ -769,6 +536,18 @@ const {
   importWallpaperMedia,
   importUploadedVideo,
 } = mediaService;
+
+const network = createNetworkAdapter();
+const netease = createNeteaseService({
+  repoRoot,
+  userLayoutsRoot,
+  builtInLayoutsRoot,
+  atomicWrite,
+  runBuild,
+  network,
+  loadModuleRegistry,
+  snapshotLayout,
+});
 
 const fileTransaction = createFileTransactionService({
   stageFile,
@@ -1157,32 +936,48 @@ async function handleApi(req, res, url) {
     } catch (error) { return fail(res, error.statusCode || 400, error.message || '保存模块失败。'); }
   }
   if (req.method === 'POST' && pathname === '/api/music/netease/import') {
-    try { return send(res, 201, { ok: true, ...(await importNeteasePlaylist(JSON.parse((await readBody(req, 32 * 1024)).toString('utf8')))) }); }
-    catch (error) { return fail(res, 400, error.message || '网易云歌单导入失败。'); }
+    try {
+      const request = JSON.parse((await readBody(req, 32 * 1024)).toString('utf8'));
+      return send(res, 201, { ok: true, ...(await netease.importPlaylist(request)) });
+    } catch (error) {
+      return fail(res, Number.isInteger(error.statusCode) ? error.statusCode : 400, error.message || '网易云歌单导入失败。');
+    }
   }
   if (req.method === 'GET' && pathname === '/api/music/netease/status') {
-    try { return send(res, 200, await neteaseSnapshotStatus(url.searchParams.get('id'))); }
-    catch (error) { return fail(res, 400, error.message || '读取网易云歌单状态失败。'); }
+    try { return send(res, 200, await netease.snapshotStatus(url.searchParams.get('id'))); }
+    catch (error) { return fail(res, Number.isInteger(error.statusCode) ? error.statusCode : 400, error.message || '读取网易云歌单状态失败。'); }
   }
   if (req.method === 'GET' && pathname === '/api/music/netease/list') {
-    try { return send(res, 200, await listNeteaseSnapshots()); }
-    catch (error) { return fail(res, 500, error.message || '读取网易云歌单列表失败。'); }
+    try { return send(res, 200, await netease.listSnapshots()); }
+    catch (error) { return fail(res, Number.isInteger(error.statusCode) ? error.statusCode : 500, error.message || '读取网易云歌单列表失败。'); }
   }
   if (req.method === 'GET' && pathname === '/api/music/netease/tracks') {
-    try { return send(res, 200, await neteaseSnapshotTracks(url.searchParams.get('id'))); }
-    catch (error) { return fail(res, 400, error.message || '读取歌单歌曲失败。'); }
+    try { return send(res, 200, await netease.snapshotTracks(url.searchParams.get('id'))); }
+    catch (error) { return fail(res, Number.isInteger(error.statusCode) ? error.statusCode : 400, error.message || '读取歌单歌曲失败。'); }
   }
   if (req.method === 'POST' && pathname === '/api/music/netease/check') {
-    try { return send(res, 200, await checkNeteaseTrackAvailability(JSON.parse((await readBody(req, 8 * 1024)).toString('utf8')))); }
-    catch (error) { return fail(res, 400, error.message || '检测歌曲音源失败。'); }
+    try {
+      const request = JSON.parse((await readBody(req, 8 * 1024)).toString('utf8'));
+      return send(res, 200, await netease.checkTrackAvailability(request));
+    } catch (error) {
+      return fail(res, Number.isInteger(error.statusCode) ? error.statusCode : 400, error.message || '检测歌曲音源失败。');
+    }
   }
   if (req.method === 'POST' && pathname === '/api/music/netease/exclusions') {
-    try { return send(res, 200, { ok: true, ...(await saveNeteaseExclusions(JSON.parse((await readBody(req, 32 * 1024)).toString('utf8')))) }); }
-    catch (error) { return fail(res, 400, error.message || '保存歌单剔除设置失败。'); }
+    try {
+      const request = JSON.parse((await readBody(req, 32 * 1024)).toString('utf8'));
+      return send(res, 200, { ok: true, ...(await netease.saveExclusions(request)) });
+    } catch (error) {
+      return fail(res, Number.isInteger(error.statusCode) ? error.statusCode : 400, error.message || '保存歌单剔除设置失败。');
+    }
   }
   if (req.method === 'POST' && pathname === '/api/music/netease/activate') {
-    try { return send(res, 200, { ok: true, ...(await activateNeteasePlaylist(JSON.parse((await readBody(req, 8 * 1024)).toString('utf8')).playlistId)) }); }
-    catch (error) { return fail(res, 400, error.message || '启用网易云歌单失败。'); }
+    try {
+      const request = JSON.parse((await readBody(req, 8 * 1024)).toString('utf8'));
+      return send(res, 200, { ok: true, ...(await netease.activatePlaylist(request.playlistId)) });
+    } catch (error) {
+      return fail(res, Number.isInteger(error.statusCode) ? error.statusCode : 400, error.message || '启用网易云歌单失败。');
+    }
   }
   if (req.method === 'DELETE' && pathname === '/api/modules') {
     try { return send(res, 200, { ok: true, ...(await uninstallSiteModule(String(url.searchParams.get('id') || ''))) }); }
