@@ -23,6 +23,15 @@ const schemaPath = path.join(themeRoot, 'docs/protocol/module-manifest.v1.schema
 const schema = JSON.parse(fs.readFileSync(schemaPath, 'utf8'));
 const ajv = new Ajv({ allErrors: true });
 const validate = ajv.compile(schema);
+const fixturesPath = path.join(themeRoot, 'docs/protocol/v1-fixtures.json');
+const fixtures = JSON.parse(fs.readFileSync(fixturesPath, 'utf8'));
+for (const fixture of fixtures.valid || []) {
+  if (!validate(fixture.manifest)) throw new Error(`Protocol fixture "${fixture.name}" should be valid: ${ajv.errorsText(validate.errors)}`);
+}
+for (const fixture of fixtures.invalid || []) {
+  if (validate(fixture.manifest)) throw new Error(`Protocol fixture "${fixture.name}" should be invalid.`);
+}
+
 const modulesPath = path.join(themeRoot, 'data/lily/modules');
 let count = 0;
 
