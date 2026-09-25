@@ -1,4 +1,4 @@
-import { api, beginOperation, endOperation, trackedFetch, updateOperation } from './core/api.js';
+import { api, trackedFetch } from './core/api.js';
 import { $, esc, toast } from './core/dom.js';
 import { allowedViews, state } from './core/state.js';
 import { decorateNavigation } from './core/icons.js';
@@ -7,6 +7,7 @@ import { selectOptionIndex, selectOptionLabel, selectOptionValue } from './core/
 import { renderModules, leaveModuleEditor } from './features/module-library.js';
 import { renderPublish } from './features/publish.js';
 import { renderAppearance } from './features/appearance.js';
+import { createImportFeature } from './features/importer.js';
 
 decorateNavigation();
 
@@ -282,149 +283,6 @@ function renderProfile() {
 }
 async function showImporter() {
   setView("import");
-}
-function importPage() {
-  $("#main").innerHTML =
-    page(
-      "导入 Typora Markdown",
-      "拖入 .md 与其图片目录（可一起拖入整个文章文件夹），或点击下方按钮选择；正文保持原样。",
-    ) +
-    `<section id="drop" class="drop"><h2>拖入 Markdown / 文章目录 / 图片</h2><p>自动读取 Front Matter、识别图片引用并归位到 Page Bundle。</p><button class="btn primary" id="choose-md">选择 Markdown 与图片</button> <button class="btn" id="choose-folder">选择文章目录</button></section><div id="plan"></div>`;
-  let d = $("#drop");
-  ["dragenter", "dragover"].forEach((x) =>
-    d.addEventListener(x, (e) => {
-      e.preventDefault();
-      d.classList.add("over");
-    }),
-  );
-  ["dragleave", "drop"].forEach((x) =>
-    d.addEventListener(x, (e) => {
-      e.preventDefault();
-      d.classList.remove("over");
-    }),
-  );
-  d.addEventListener("drop", async (e) => {
-    let items = await collectDropFiles(e.dataTransfer);
-    readFiles(items);
-  });
-  $("#choose-md").onclick = () => $("#file-picker").click();
-  $("#choose-folder").onclick = () => $("#folder-picker").click();
-  bindCommon();
-}
-async function collectDropFiles(dt) {
-  let out = [];
-  let entries = [...(dt.items || [])]
-    .map((i) => {
-      try {
-        return i.webkitGetAsEntry && i.webkitGetAsEntry();
-      } catch {
-        return null;
-      }
-    })
-    .filter(Boolean);
-  if (entries.length) {
-    for (let en of entries) await walkDropEntry(en, "", out);
-    if (out.length) return out;
-  }
-  return [...dt.files].map((f) => ({
-    file: f,
-    relativePath: f.webkitRelativePath || f.name,
-  }));
-}
-async function walkDropEntry(en, prefix, out) {
-  if (en.isFile) {
-    let f = await new Promise((r, j) => en.file(r, j));
-    out.push({ file: f, relativePath: prefix + en.name });
-  } else if (en.isDirectory) {
-    let rd = en.createReader();
-    let batch;
-    do {
-      batch = await new Promise((r, j) => rd.readEntries(r, j));
-      for (let ce of batch)
-        await walkDropEntry(ce, prefix + en.name + "/", out);
-    } while (batch.length);
-  }
-}
-async function readFiles(files) {
-  const operation = beginOperation(`正在读取文件 0/${files.length}`);
-  try {
-    let payload = [];
-    for (let f of files) {
-      let file = f.file || f;
-      payload.push({
-        name: file.name,
-        relativePath:
-          f.relativePath || file.webkitRelativePath || file.name,
-        type: file.type,
-        content: await as64(file),
-      });
-      updateOperation(operation, `正在读取文件 ${payload.length}/${files.length}`);
-    }
-    state.import = { payload };
-    await runInspect();
-  } catch (e) {
-    toast(e.message);
-  } finally { endOperation(operation); }
-}
-async function runInspect() {
-  try {
-    let payload = state.import.payload;
-    let plan = await api("/api/import/inspect", {
-      method: "POST",
-      body: JSON.stringify({ files: payload }),
-    });
-    state.import.plan = plan;
-    let missing = plan.missing || [];
-    $("#plan").innerHTML =
-      `<div class="import-plan"><h2>确认导入</h2><div class="kv"><span>标题</span><b>${esc(plan.title)}</b></div><div class="kv"><span>目标路径</span><b class="path">content/posts/${esc(plan.slug)}/index.md</b></div><div class="kv"><span>Front Matter</span><b>${plan.hasFrontMatter ? "已识别，保持原样" : "未发现，将补充最小 Hugo Front Matter"}</b></div><div class="kv"><span>关联资源</span><b>${plan.assetCount} 个${missing.length ? `；<span style="color:var(--danger)">缺少 ${missing.length} 张图片</span>` : ""}</b></div>${plan.rewriteCount ? `<div class="kv"><span>本地图片引用</span><b>自动改写 ${plan.rewriteCount} 处为博客路径</b></div>` : ""}${missing.length ? `<div class="kv"><span>缺失图片</span><b class="path" style="color:var(--danger)">${esc(missing.join("<br>"))}</b></div><p><label class="btn primary" style="display:inline-block">补选缺失图片（可多选）<input id="missing-pick" type="file" accept="image/*" multiple hidden></label> <span class="muted">按文件名自动匹配归位，选完自动重新检查</span></p>` : ""}<label class="switch"><span><b>发布为草稿</b><p>没有 Front Matter 时默认安全导入为草稿</p></span><input id="import-draft" type="checkbox" checked></label><p><button class="btn primary" id="confirm-import">导入</button> <button class="btn" id="cancel-import">取消</button></p></div>`;
-    let pick = $("#missing-pick");
-    if (pick)
-      pick.onchange = async (e) => {
-        let extra = [...e.target.files];
-        if (!extra.length) return;
-        for (let f of extra)
-          state.import.payload.push({
-            name: f.name,
-            relativePath: f.name,
-            type: f.type,
-            content: await as64(f),
-          });
-        toast("已补选 " + extra.length + " 张图片，重新检查引用…");
-        await runInspect();
-      };
-    $("#confirm-import").onclick = async () => {
-      try {
-        let r = await api("/api/import", {
-          method: "POST",
-          body: JSON.stringify({
-            files: payload,
-            draft: $("#import-draft").checked,
-          }),
-        });
-        toast(
-          `已导入 ${r.path}${r.assetCount ? `（含 ${r.assetCount} 张图片）` : ""}`,
-        );
-        await refresh();
-        setView("articles");
-        openArticle(r.path);
-      } catch (e) {
-        toast(e.message);
-      }
-    };
-    $("#cancel-import").onclick = () => {
-      $("#plan").innerHTML = "";
-      state.import = null;
-    };
-  } catch (e) {
-    toast(e.message);
-  }
-}
-async function as64(f) {
-  let b = await f.arrayBuffer(),
-    a = new Uint8Array(b),
-    s = "";
-  for (let x of a) s += String.fromCharCode(x);
-  return btoa(s);
 }
 async function openArticle(path) {
   let d = await api("/api/post?path=" + encodeURIComponent(path)),
@@ -1050,6 +908,8 @@ async function layouts() {
 async function modules() {
   await renderModules({ page, bindCommon, navigate: setView });
 }
+const importFeature = createImportFeature({ page, bindCommon, setView, refresh, openArticle });
+
 async function render() {
   nav();
   if (state.view === "overview") overview();
@@ -1057,7 +917,7 @@ async function render() {
   else if (state.view === "drawers") await drawers();
   else if (state.view === "friends") await friends();
   else if (state.view === "profile") await profile();
-  else if (state.view === "import") importPage();
+  else if (state.view === "import") importFeature.render();
   else if (state.view === "layouts") await layouts();
   else if (state.view === "modules") await modules();
   else if (state.view === "appearance") await renderAppearance({ page, bindCommon });
@@ -1072,8 +932,8 @@ document.querySelectorAll("#nav button").forEach(
       setView(b.dataset.view);
     }),
 );
-$("#file-picker").onchange = (e) => readFiles([...e.target.files]);
-$("#folder-picker").onchange = (e) => readFiles([...e.target.files]);
+$("#file-picker").onchange = (e) => importFeature.readFiles([...e.target.files]);
+$("#folder-picker").onchange = (e) => importFeature.readFiles([...e.target.files]);
 refresh().catch((e) => {
   $("#main").innerHTML =
     '<div class="empty">无法连接 lilymap API：' +
