@@ -19,6 +19,7 @@ import { createSiteSettingsService } from './src/services/site-settings-service.
 import { createMediaService, mediaKind as classifyMedia } from './src/services/media-service.mjs';
 import { createNetworkAdapter } from './src/services/network-adapter.mjs';
 import { createNeteaseService } from './src/services/netease-service.mjs';
+import { createLayoutModuleService } from './src/services/layout-module-service.mjs';
 import { safeSlug } from './src/domain/slug.mjs';
 import YAML from 'yaml';
 import { formatYamlValue, parseFrontMatter, patchFrontMatter } from './src/domain/front-matter.mjs';
@@ -33,6 +34,7 @@ import { createSettingsRoutes } from './src/http/routes/settings-routes.mjs';
 import { createMediaRoutes } from './src/http/routes/media-routes.mjs';
 import { createNeteaseRoutes } from './src/http/routes/netease-routes.mjs';
 import { createPublishRoutes } from './src/http/routes/publish-routes.mjs';
+import { createLayoutModuleRoutes } from './src/http/routes/layout-module-routes.mjs';
 import { updateModulePlacement } from './src/domain/module-config.mjs';
 
 // esbuild 打包成 cjs 后 __dirname 可用；dev 模式（node 直接跑 ESM）下 __dirname 不存在，
@@ -268,125 +270,6 @@ async function walk(root, predicate = () => true) {
   return entries;
 }
 
-function layoutRevisionRoot(name) { return path.join(trashRoot, 'layouts', name); }
-
-async function snapshotLayout(name, target) {
-  if (!(await exists(target))) return null;
-  const stamp = new Date().toISOString().replace(/[:.]/g, '-');
-  const destination = path.join(layoutRevisionRoot(name), `${stamp}.yaml`);
-  await fs.mkdir(path.dirname(destination), { recursive: true });
-  await fs.copyFile(target, destination);
-  return relativeToRepo(destination);
-}
-
-async function layoutHistory(name) {
-  if (!/^[\w-]+$/.test(name)) throw new Error('布局名称不合法。');
-  const root = layoutRevisionRoot(name);
-  if (!(await exists(root))) return [];
-  const files = (await fs.readdir(root, { withFileTypes: true }))
-    .filter((entry) => entry.isFile() && /^\d{4}-\d{2}-\d{2}T[\d-]+Z\.yaml$/.test(entry.name))
-    .map((entry) => entry.name)
-    .sort()
-    .reverse();
-  return Promise.all(files.map(async (file) => {
-    const target = path.join(root, file);
-    const stat = await fs.stat(target);
-    return { revision: file, savedAt: stat.mtime.toISOString(), path: relativeToRepo(target) };
-  }));
-}
-
-async function yamlFiles(root) { return (await exists(root)) ? (await fs.readdir(root)).filter((name) => name.endsWith('.yaml')).sort().map((name) => path.join(root, name)) : []; }
-
-async function loadModuleRegistry() {
-  const modules = {};
-  for (const [root, source] of [[builtInModulesRoot, 'built-in'], [userModulesRoot, 'site']]) {
-    for (const file of await yamlFiles(root)) { const id = path.basename(file, '.yaml'); modules[id] = normalizeModuleManifest(id, await fs.readFile(file, 'utf8'), source); }
-  }
-  if (modules.welcome) {
-    const values = parseToml(await fs.readFile(path.join(repoRoot, 'hugo.toml'), 'utf8')).values;
-    modules.welcome.siteDefaults = {};
-    for (const key of Object.keys(modules.welcome.schema)) {
-      const setting = Object.keys(values).find((name) => name.toLowerCase() === `params.welcome.${key}`.toLowerCase());
-      if (setting) modules.welcome.siteDefaults[key] = values[setting];
-    }
-  }
-  return modules;
-}
-
-async function loadLayoutEditor() {
-  const layouts = new Map();
-  for (const [root, source] of [[builtInLayoutsRoot, 'built-in'], [userLayoutsRoot, 'site']]) {
-    for (const file of await yamlFiles(root)) { const name = path.basename(file, '.yaml'); const raw = await fs.readFile(file, 'utf8'); layouts.set(name, { name, parsed: parseLayout(raw, `布局 ${name}`), raw, source }); }
-  }
-  return { layouts: [...layouts.values()].sort((a, b) => a.name.localeCompare(b.name)), modules: await loadModuleRegistry() };
-}
-
-function siteModulePaths(id, manifest) {
-  const relative = [
-    `data/lily/modules/${id}.yaml`,
-    manifest.template?.partial ? `layouts/partials/${manifest.template.partial}` : `layouts/partials/lily/modules/${id}/render.html`,
-    ...(manifest.assets?.styles || []).map((file) => `assets/${file}`),
-    ...(manifest.assets?.scripts || []).map((file) => `assets/${file}`),
-  ];
-  return [...new Set(relative.map((file) => repoPath(file, [repoRoot])).filter(Boolean))];
-}
-
-async function moduleUsage() {
-  const { layouts, modules } = await loadLayoutEditor();
-  const usage = {};
-  for (const layout of layouts) {
-    for (const [slot, instances] of Object.entries(layout.parsed.slots)) {
-      for (const instance of instances) (usage[instance.module] ||= []).push({ layout: layout.name, slot, instance: instance.id });
-    }
-  }
-  return { modules, layouts, usage };
-}
-
-async function installSiteModule(request) {
-  if (typeof request.manifest !== 'string' || request.manifest.length > maxBodyBytes) throw new Error('模块 manifest 无效。');
-  const rawManifest = request.manifest.replace(/^\uFEFF/, '');
-  const preview = parseYaml(rawManifest, '模块 manifest');
-  const id = String(preview.id || '').trim();
-  const manifest = normalizeModuleManifest(id, rawManifest, 'site');
-  if (manifest.template.partial !== `lily/modules/${id}/render.html`) throw new Error('本地模块模板必须位于 lily/modules/<id>/render.html。');
-  if (typeof request.template !== 'string' || !request.template.trim() || request.template.length > maxBodyBytes) throw new Error('模块必须提供 render.html 模板。');
-  const registry = await loadModuleRegistry();
-  if (registry[id] && registry[id].source === 'built-in') throw new Error('不能覆盖内置模块；请使用新的模块 id。');
-  if (registry[id] && request.replace !== true) throw new Error('该本地模块已存在；确认更新后再覆盖。');
-  const stylePath = `lily/modules/${id}.css`; const scriptPath = `lily/modules/${id}.js`;
-  for (const file of manifest.assets.styles || []) if (file !== stylePath) throw new Error(`CSS 必须命名为 ${stylePath}。`);
-  for (const file of manifest.assets.scripts || []) if (file !== scriptPath) throw new Error(`JS 必须命名为 ${scriptPath}。`);
-  if ((manifest.assets.styles || []).includes(stylePath) && typeof request.style !== 'string') throw new Error('manifest 声明了 CSS，但未提供样式内容。');
-  if ((manifest.assets.scripts || []).includes(scriptPath) && typeof request.script !== 'string') throw new Error('manifest 声明了 JS，但未提供脚本内容。');
-  const files = [
-    { target: path.join(userModulesRoot, `${id}.yaml`), content: rawManifest },
-    { target: path.join(repoRoot, 'layouts', 'partials', manifest.template.partial), content: request.template },
-  ];
-  if ((manifest.assets.styles || []).includes(stylePath)) files.push({ target: path.join(repoRoot, 'assets', stylePath), content: request.style });
-  if ((manifest.assets.scripts || []).includes(scriptPath)) files.push({ target: path.join(repoRoot, 'assets', scriptPath), content: request.script });
-  await fileTransaction.replaceFiles(files);
-  return { id, manifest };
-}
-
-async function uninstallSiteModule(id) {
-  const registry = await loadModuleRegistry(); const manifest = registry[id];
-  if (!manifest) throw new Error('模块不存在。');
-  if (manifest.source !== 'site') throw new Error('内置模块不能卸载；可以从布局中移除。');
-  const { usage } = await moduleUsage();
-  if (usage[id]?.length) throw new Error(`模块仍被 ${usage[id].map((item) => `${item.layout}.${item.slot}`).join('、')} 使用，请先从布局移除。`);
-  const stamp = new Date().toISOString().replace(/[:.]/g, '-');
-  const destinationRoot = path.join(trashRoot, 'modules', `${stamp}-${id}`);
-  for (const source of siteModulePaths(id, manifest)) {
-    if (!(await exists(source))) continue;
-    const destination = inside(destinationRoot, relativeToRepo(source));
-    if (!destination) throw new Error('模块回收路径无效。');
-    await fs.mkdir(path.dirname(destination), { recursive: true });
-    await fs.rename(source, destination);
-  }
-  scheduleBuild();
-  return { id, trashedTo: relativeToRepo(destinationRoot) };
-}
-
 function versionFor(raw, stat) { return `${stat.size}:${createHash('sha256').update(raw).digest('hex').slice(0, 16)}`; }
 
 const { git, gitNetwork, systemGitProxy, safeGitFailure, gitChanges } = createGitService({ repoRoot });
@@ -526,6 +409,26 @@ const {
 } = mediaService;
 
 const network = createNetworkAdapter();
+
+const fileTransaction = createFileTransactionService({
+  stageFile,
+  atomicWrite,
+  scheduleBuild,
+});
+
+const layoutModules = createLayoutModuleService({
+  repoRoot,
+  builtInLayoutsRoot,
+  userLayoutsRoot,
+  builtInModulesRoot,
+  userModulesRoot,
+  trashRoot,
+  maxBodyBytes,
+  fileTransaction,
+  atomicWrite,
+  scheduleBuild,
+});
+
 const netease = createNeteaseService({
   repoRoot,
   userLayoutsRoot,
@@ -533,14 +436,8 @@ const netease = createNeteaseService({
   atomicWrite,
   runBuild,
   network,
-  loadModuleRegistry,
-  snapshotLayout,
-});
-
-const fileTransaction = createFileTransactionService({
-  stageFile,
-  atomicWrite,
-  scheduleBuild,
+  loadModuleRegistry: layoutModules.loadModuleRegistry,
+  snapshotLayout: layoutModules.snapshotLayout,
 });
 
 const siteSettings = createSiteSettingsService({
@@ -585,6 +482,7 @@ const publishRoutes = createPublishRoutes({
   systemGitProxy,
   exists,
 });
+const layoutModuleRoutes = createLayoutModuleRoutes({ readBody, send, fail, layoutModules });
 
 async function handleApi(req, res, url) {
   const pathname = url.pathname;
@@ -596,6 +494,7 @@ async function handleApi(req, res, url) {
   if (await mediaRoutes(req, res, url)) return;
   if (await neteaseRoutes(req, res, url)) return;
   if (await publishRoutes(req, res, url)) return;
+  if (await layoutModuleRoutes(req, res, url)) return;
   if (req.method === 'GET' && pathname === '/api/posts') return send(res, 200, { posts: await listPosts() });
   if (req.method === 'GET' && pathname === '/api/admin/export') {
     const archive = await createLilyMapSourceArchive({ repoRoot, adminDir });
@@ -871,90 +770,6 @@ async function handleApi(req, res, url) {
     try { await atomicWrite(target, bytes); }
     catch (error) { await fs.rename(backup, target).catch(() => {}); throw error; }
     return send(res, 200, { ok: true, backup: relativeToRepo(backup) });
-  }
-  if (req.method === 'GET' && pathname === '/api/modules') {
-    const { modules, usage } = await moduleUsage();
-    return send(res, 200, { protocol: 'lily-module/v1', modules: Object.values(modules).sort((a, b) => a.name.localeCompare(b.name)), usage });
-  }
-  if (req.method === 'POST' && pathname === '/api/modules/install') {
-    try { return send(res, 201, { ok: true, ...(await installSiteModule(JSON.parse((await readBody(req)).toString('utf8')))) }); }
-    catch (error) { return fail(res, 400, error.message || '模块安装失败。'); }
-  }
-  if (req.method === 'PUT' && pathname === '/api/modules/config') {
-    try {
-      const request = JSON.parse((await readBody(req)).toString('utf8'));
-      if (!/^[\w-]+$/.test(request.layout || '')) throw new Error('布局名称不合法。');
-      const { layouts, modules } = await loadLayoutEditor();
-      const current = layouts.find((entry) => entry.name === request.layout);
-      if (!current) throw new Error('布局不存在。');
-      const { layout, placement } = updateModulePlacement(current.parsed, modules, request);
-      const target = inside(userLayoutsRoot, `${request.layout}.yaml`);
-      if (!target) throw new Error('布局路径不安全。');
-      const backup = await snapshotLayout(request.layout, target);
-      await atomicWrite(target, serializeLayout(layout));
-      scheduleBuild();
-      return send(res, 200, { ok: true, placement, backup });
-    } catch (error) { return fail(res, error.statusCode || 400, error.message || '保存模块失败。'); }
-  }
-  if (req.method === 'DELETE' && pathname === '/api/modules') {
-    try { return send(res, 200, { ok: true, ...(await uninstallSiteModule(String(url.searchParams.get('id') || ''))) }); }
-    catch (error) { return fail(res, 400, error.message || '模块卸载失败。'); }
-  }
-  if (req.method === 'GET' && pathname === '/api/layouts') {
-    try { return send(res, 200, await loadLayoutEditor()); }
-    catch (error) { return fail(res, 500, error.message || '读取布局失败。'); }
-  }
-  if (req.method === 'PUT' && pathname === '/api/layouts') {
-    const request = JSON.parse((await readBody(req)).toString('utf8'));
-    const name = String(request.name || '');
-    if (!/^[\w-]+$/.test(name)) return fail(res, 400, '布局名称不合法。');
-    const candidate = typeof request.raw === 'string' ? request.raw : (request.parsed ? YAML.stringify(request.parsed) : '');
-    if (!candidate || candidate.length > maxBodyBytes) return fail(res, 400, '布局内容无效。');
-    try {
-      const layout = parseLayout(candidate, `布局 ${name}`);
-      const modules = await loadModuleRegistry();
-      validateLayoutAgainstRegistry(layout, modules);
-      const target = inside(userLayoutsRoot, `${name}.yaml`);
-      if (!target) return fail(res, 400, '布局路径不安全。');
-      const backup = await snapshotLayout(name, target);
-      await atomicWrite(target, serializeLayout(layout));
-      return send(res, 200, { ok: true, path: relativeToRepo(target), source: 'site', backup });
-    } catch (error) { return fail(res, 400, error.message || '布局内容无效。'); }
-  }
-  if (req.method === 'GET' && pathname === '/api/layouts/history') {
-    try { return send(res, 200, { history: await layoutHistory(String(url.searchParams.get('name') || '')) }); }
-    catch (error) { return fail(res, 400, error.message || '读取布局历史失败。'); }
-  }
-  if (req.method === 'POST' && pathname === '/api/layouts/restore') {
-    try {
-      const request = JSON.parse((await readBody(req)).toString('utf8'));
-      const name = String(request.name || ''); const revision = String(request.revision || '');
-      if (!/^[\w-]+$/.test(name) || !/^\d{4}-\d{2}-\d{2}T[\d-]+Z\.yaml$/.test(revision)) throw new Error('布局历史版本无效。');
-      const source = inside(layoutRevisionRoot(name), revision);
-      const target = inside(userLayoutsRoot, `${name}.yaml`);
-      if (!source || !target || !(await exists(source))) throw new Error('布局历史版本不存在。');
-      const layout = parseLayout(await fs.readFile(source, 'utf8'), `布局历史 ${name}`);
-      validateLayoutAgainstRegistry(layout, await loadModuleRegistry());
-      const backup = await snapshotLayout(name, target);
-      await atomicWrite(target, serializeLayout(layout));
-      return send(res, 200, { ok: true, path: relativeToRepo(target), backup });
-    } catch (error) { return fail(res, 400, error.message || '恢复布局失败。'); }
-  }
-  if (req.method === 'POST' && pathname === '/api/layouts/reset') {
-    try {
-      const request = JSON.parse((await readBody(req)).toString('utf8'));
-      const name = String(request.name || '');
-      if (!/^[\w-]+$/.test(name)) throw new Error('布局名称不合法。');
-      const target = inside(userLayoutsRoot, `${name}.yaml`);
-      const builtIn = inside(builtInLayoutsRoot, `${name}.yaml`);
-      if (!target || !builtIn || !(await exists(target)) || !(await exists(builtIn))) throw new Error('该布局没有可恢复的主题默认版本。');
-      const stamp = new Date().toISOString().replace(/[:.]/g, '-');
-      const destination = path.join(layoutRevisionRoot(name), `override-${stamp}.yaml`);
-      await fs.mkdir(path.dirname(destination), { recursive: true });
-      await fs.rename(target, destination);
-      scheduleBuild();
-      return send(res, 200, { ok: true, restoredSource: 'built-in', trashedTo: relativeToRepo(destination) });
-    } catch (error) { return fail(res, 400, error.message || '恢复主题默认失败。'); }
   }
   if (req.method === 'GET' && pathname === '/api/git/diff') {
     const target = url.searchParams.get('path');
