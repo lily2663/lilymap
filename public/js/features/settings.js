@@ -1,6 +1,7 @@
 import { api } from '../core/api.js';
 import { $, esc, toast } from '../core/dom.js';
 import { state } from '../core/state.js';
+import { selectOptionIndex, selectOptionLabel, selectOptionValue } from '../core/value.js';
 
 function settingField(field, currentValue) {
   const value = currentValue ?? field.default ?? '';
@@ -9,7 +10,8 @@ function settingField(field, currentValue) {
     return `<label class="switch"><span><b>${esc(field.label)}</b><p>${esc(help)}</p></span><input data-config="${field.path}" type="checkbox" ${value ? 'checked' : ''}></label>`;
   }
   if (field.type === 'select') {
-    return `<label class="field"><span>${esc(field.label)}</span><select data-config="${field.path}">${(field.options || []).map((option) => `<option value="${esc(option.value)}" ${option.value === value ? 'selected' : ''}>${esc(option.label)}</option>`).join('')}</select><small class="muted">${esc(help)}</small></label>`;
+    const selected = selectOptionIndex(field, value);
+    return `<label class="field"><span>${esc(field.label)}</span><select data-config="${field.path}">${(field.options || []).map((option, index) => `<option value="${index}" ${index === selected ? 'selected' : ''}>${esc(selectOptionLabel(option))}</option>`).join('')}</select><small class="muted">${esc(help)}</small></label>`;
   }
   const type = field.type === 'number' ? 'number' : field.type === 'color' ? 'color' : field.type === 'url' ? 'url' : 'text';
   const limits = field.type === 'number'
@@ -56,7 +58,9 @@ export async function renderSettings({ page, bindCommon, refresh }) {
           ? element.checked
           : field.type === 'number'
             ? Number(element.value)
-            : element.value;
+            : field.type === 'select'
+              ? selectOptionValue(field, element.value)
+              : element.value;
       });
       const nextMenus = [...document.querySelectorAll('.menu-item')].map((element) => ({
         name: element.querySelector('[data-menu=name]').value,
