@@ -9,6 +9,7 @@ import { networkInterfaces } from 'node:os';
 import { resolveInside } from './src/fs/path-security.mjs';
 import { createAtomicFileService } from './src/fs/atomic-files.mjs';
 import { createLilyMapSourceArchive } from './src/services/source-archive.mjs';
+import { createBuildService } from './src/services/build-service.mjs';
 import YAML from 'yaml';
 import { formatYamlValue, parseFrontMatter, patchFrontMatter } from './src/domain/front-matter.mjs';
 import { parseToml, patchMenus, patchTomlValue } from './src/domain/toml.mjs';
@@ -117,7 +118,6 @@ const hugoSource = hugoExecutable === 'hugo' ? '系统 PATH' : hugoExecutable ==
 const maxBodyBytes = 8 * 1024 * 1024;
 const maxMediaBodyBytes = 160 * 1024 * 1024;
 const maxDecodedImageBytes = 64 * 1024 * 1024;
-const maxBuildOutputBytes = 16 * 1024;
 const { adminHostAllowed, adminOriginAllowed, fail, hasExpectedImageSignature, httpError, readBody, send, staticSecurityHeaders } = createHttpPrimitives({
   port,
   maxBodyBytes,
@@ -141,15 +141,6 @@ const previewState = {
   startedAt: null,
   stoppedAt: null,
 };
-const buildState = {
-  status: 'idle',
-  trigger: '',
-  queuedAt: null,
-  startedAt: null,
-  finishedAt: null,
-  code: null,
-  output: '',
-};
 let publishState = null;
 
 function publishSnapshot() {
@@ -165,16 +156,6 @@ function publishSnapshot() {
     startedAt: publishState.startedAt,
     finishedAt: publishState.finishedAt,
   };
-}
-
-function trimBuildOutput(value) {
-  const output = String(value || '');
-  if (Buffer.byteLength(output, 'utf8') <= maxBuildOutputBytes) return output;
-  return `…（输出已截断）\n${output.slice(-maxBuildOutputBytes)}`;
-}
-
-function buildSnapshot() {
-  return { ...buildState, output: trimBuildOutput(buildState.output) };
 }
 
 function lanPreviewAddresses() {
@@ -1109,60 +1090,17 @@ async function remapDrawerPostPath(previous, next = '') {
   if (changed) await atomicWrite(drawersFile, YAML.stringify({ drawers }), { schedule: false });
 }
 
-// 构建管理：admin server 自己持有 Hugo 构建，不再依赖外部 hugo server。
-// 每次内容/配置变更后延迟触发一次一次性构建（约 1.4s），比外部 hugo server
-// 的全量重建更快，且不存在多实例抢 public/ 锁导致的失败。
-// 站点图片上传走 static→public 直拷，即时可见，不触发构建。
-let buildTimer = null;
-let buildChain = Promise.resolve();
-
-function scheduleBuild(delay = 500) {
-  if (buildTimer) clearTimeout(buildTimer);
-  buildState.queuedAt = new Date().toISOString();
-  if (buildState.status !== 'running') buildState.status = 'queued';
-  buildState.trigger = 'scheduled';
-  buildTimer = setTimeout(() => { buildTimer = null; void runBuild(); }, delay);
-}
-
-async function runBuild(minify = false, trigger = 'manual') {
-  if (buildState.status !== 'running') buildState.status = 'queued';
-  buildState.queuedAt ||= new Date().toISOString();
-  buildState.trigger = trigger;
-  const task = buildChain.then(async () => {
-    buildState.status = 'running';
-    buildState.startedAt = new Date().toISOString();
-    buildState.finishedAt = null;
-    buildState.code = null;
-    buildState.output = '';
-    buildState.queuedAt = null;
-    let result;
-    try {
-      // 不碰 Hugo 的构建锁：它也可能属于用户在另一个终端运行的 Hugo 实例。
-      // 本服务自身的构建已由 buildChain 串行化，遇到外部锁时把 Hugo 的诊断原样返回。
-      const args = minify
-        ? ['--gc', '--minify', '--cacheDir', path.join(repoRoot, '.cache', 'hugo')]
-        : ['--cacheDir', path.join(repoRoot, '.cache', 'hugo')];
-      result = await new Promise((resolve) => {
-        const child = spawn(hugoExecutable, args, { cwd: repoRoot, windowsHide: true, shell: false });
-        let output = '';
-        child.stdout.on('data', (data) => { output += data; });
-        child.stderr.on('data', (data) => { output += data; });
-        child.on('close', (code) => resolve({ code: Number.isInteger(code) ? code : 1, output }));
-        child.on('error', (error) => resolve({ code: 1, output: error.message === 'spawn hugo ENOENT' ? '未找到 Hugo。请安装 Hugo，或在 lilymap.json 中设置 hugoPath。' : error.message }));
-      });
-    } catch (error) {
-      result = { code: 1, output: error.message || 'Hugo 构建过程异常。' };
-    }
-    buildState.code = result.code;
-    buildState.output = trimBuildOutput(result.output);
-    buildState.finishedAt = new Date().toISOString();
-    buildState.status = result.code === 0 ? 'success' : 'error';
-    if (result.code !== 0) console.error(`Hugo 构建失败：${buildState.output}`);
-    return { ...result, output: trimBuildOutput(result.output), build: buildSnapshot() };
-  });
-  buildChain = task.catch(() => {});
-  return task;
-}
+// 构建管理：admin server 自己持有 Hugo 构建，不依赖外部 hugo server。
+const {
+  scheduleBuild,
+  cancelScheduledBuild,
+  runBuild,
+  snapshot: buildSnapshot,
+} = createBuildService({
+  repoRoot,
+  hugoExecutable,
+  maxOutputBytes: 16 * 1024,
+});
 
 const { atomicWrite, atomicCreate, copyWithoutClobber } = createAtomicFileService({
   scheduleBuild,
@@ -1836,7 +1774,7 @@ async function handleApi(req, res, url) {
     const result = await git(args); return send(res, 200, { diff: result.stdout || result.stderr, code: result.code });
   }
   if (req.method === 'POST' && pathname === '/api/build') {
-    if (buildTimer) { clearTimeout(buildTimer); buildTimer = null; }
+    cancelScheduledBuild();
     const result = await runBuild(true, 'manual');
     return send(res, result.code === 0 ? 200 : 500, {
       ok: result.code === 0,
