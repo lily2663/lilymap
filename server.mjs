@@ -14,15 +14,14 @@ import { createBuildService } from './src/services/build-service.mjs';
 import { createImportPlanner } from './src/services/import-planner.mjs';
 import { createGitService } from './src/services/git-service.mjs';
 import { createPublishService } from './src/services/publish-service.mjs';
+import { createSiteSettingsService } from './src/services/site-settings-service.mjs';
 import { safeSlug } from './src/domain/slug.mjs';
 import YAML from 'yaml';
 import { formatYamlValue, parseFrontMatter, patchFrontMatter } from './src/domain/front-matter.mjs';
-import { parseToml, patchMenus, patchTomlValue } from './src/domain/toml.mjs';
+import { parseToml } from './src/domain/toml.mjs';
 import { decryptProtectedBody, encryptProtectedBody } from './src/domain/protected-content.mjs';
 import { isObject, parseYaml } from './src/domain/value.mjs';
 import { normalizeLayout, normalizeModuleManifest, parseLayout, serializeLayout, validateLayoutAgainstRegistry } from './src/domain/layout.mjs';
-import { validateFriends, validateProfile } from './src/domain/profile.mjs';
-import { validateMenus, validateThemeSettingsPatch } from './src/domain/theme-config.mjs';
 import { createHttpPrimitives } from './src/http/primitives.mjs';
 import { streamFile } from './src/http/static-files.mjs';
 import { updateModulePlacement } from './src/domain/module-config.mjs';
@@ -281,22 +280,6 @@ async function walk(root, predicate = () => true) {
   }
   await visit(root);
   return entries;
-}
-
-async function readFriends() {
-  const raw = await fs.readFile(siteDataFile, 'utf8');
-  const site = parseYaml(raw, '站点数据');
-  if (site.friends != null && !Array.isArray(site.friends)) throw new Error('站点数据中的 friends 必须是列表。');
-  return { friends: site.friends || [], version: createHash('sha256').update(raw).digest('hex') };
-}
-
-async function readProfile() {
-  const raw = await fs.readFile(siteDataFile, 'utf8');
-  const site = parseYaml(raw, '站点数据');
-  return {
-    profile: { author: site.author || '', aboutTitle: site.aboutTitle || '', about: site.about || [], links: site.links || [] },
-    version: createHash('sha256').update(raw).digest('hex'),
-  };
 }
 
 function layoutRevisionRoot(name) { return path.join(trashRoot, 'layouts', name); }
@@ -903,6 +886,16 @@ const fileTransaction = createFileTransactionService({
   scheduleBuild,
 });
 
+const siteSettings = createSiteSettingsService({
+  repoRoot,
+  siteDataFile,
+  themeRoot,
+  fileTransaction,
+  atomicWrite,
+  httpError,
+  maxBodyBytes,
+});
+
 const publishService = createPublishService({
   repoRoot,
   trashRoot,
@@ -1015,35 +1008,15 @@ async function handleApi(req, res, url) {
     return;
   }
   if (req.method === 'GET' && pathname === '/api/drawers') return send(res, 200, await readDrawers());
-  if (req.method === 'GET' && pathname === '/api/friends') return send(res, 200, await readFriends());
-  if (req.method === 'GET' && pathname === '/api/profile') return send(res, 200, await readProfile());
+  if (req.method === 'GET' && pathname === '/api/friends') return send(res, 200, await siteSettings.readFriends());
+  if (req.method === 'GET' && pathname === '/api/profile') return send(res, 200, await siteSettings.readProfile());
   if (req.method === 'PUT' && pathname === '/api/profile') {
     const request = JSON.parse((await readBody(req)).toString('utf8'));
-    const raw = await fs.readFile(siteDataFile, 'utf8');
-    if (request.version !== createHash('sha256').update(raw).digest('hex')) return fail(res, 409, '个人资料已在别处修改，请刷新后重试。');
-    const profile = validateProfile(request.profile);
-    const document = YAML.parseDocument(raw, { prettyErrors: true, uniqueKeys: true });
-    if (document.errors.length) throw httpError(400, `站点数据 YAML 无效：${document.errors[0].message}`);
-    for (const [key, value] of Object.entries(profile)) document.set(key, value);
-    const tomlPath = path.join(repoRoot, 'hugo.toml');
-    const toml = await fs.readFile(tomlPath, 'utf8');
-    await fileTransaction.replaceFiles([
-      { target: siteDataFile, content: String(document) },
-      { target: tomlPath, content: patchTomlValue(toml, 'params.author', profile.author) },
-    ]);
-    return send(res, 200, { ok: true, ...await readProfile() });
+    return send(res, 200, await siteSettings.updateProfile(request));
   }
   if (req.method === 'PUT' && pathname === '/api/friends') {
     const request = JSON.parse((await readBody(req)).toString('utf8'));
-    const raw = await fs.readFile(siteDataFile, 'utf8');
-    const version = createHash('sha256').update(raw).digest('hex');
-    if (request.version !== version) return fail(res, 409, '友链配置已在别处修改，请刷新后重试。');
-    const friends = validateFriends(request.friends);
-    const document = YAML.parseDocument(raw, { prettyErrors: true, uniqueKeys: true });
-    if (document.errors.length) throw httpError(400, `站点数据 YAML 无效：${document.errors[0].message}`);
-    document.set('friends', friends);
-    await atomicWrite(siteDataFile, String(document));
-    return send(res, 200, { ok: true, ...await readFriends() });
+    return send(res, 200, await siteSettings.updateFriends(request));
   }
   if (req.method === 'PUT' && pathname === '/api/drawers') {
     const request = JSON.parse((await readBody(req)).toString('utf8'));
@@ -1339,43 +1312,15 @@ async function handleApi(req, res, url) {
     return send(res, 200, { ok: true, backup: relativeToRepo(backup) });
   }
   if (req.method === 'GET' && pathname === '/api/settings') {
-    const raw = await fs.readFile(path.join(repoRoot, 'hugo.toml'), 'utf8');
-    const schema = JSON.parse(await fs.readFile(path.join(themeRoot, 'theme-config.schema.json'), 'utf8'));
-    return send(res, 200, { raw, ...parseToml(raw), schema });
+    return send(res, 200, await siteSettings.readSettings());
   }
   if (req.method === 'PATCH' && pathname === '/api/settings') {
     const request = JSON.parse((await readBody(req)).toString('utf8'));
-    const schema = JSON.parse(await fs.readFile(path.join(themeRoot, 'theme-config.schema.json'), 'utf8'));
-    const values = validateThemeSettingsPatch(schema, request.values || {});
-    const menus = request.menus === undefined ? null : validateMenus(request.menus);
-    const tomlPath = path.join(repoRoot, 'hugo.toml');
-    let raw = await fs.readFile(tomlPath, 'utf8');
-    for (const [fieldPath, value] of Object.entries(values)) raw = patchTomlValue(raw, fieldPath, value);
-    if (menus) raw = patchMenus(raw, menus);
-
-    const files = [{ target: tomlPath, content: raw }];
-    // The about page renders identity from data/site.yaml, so keep linked values
-    // in one transaction with hugo.toml instead of allowing a half-updated site.
-    const hasAvatar = Object.hasOwn(values, 'params.avatar');
-    const hasAuthor = Object.hasOwn(values, 'params.author');
-    if (hasAvatar || hasAuthor) {
-      const siteRaw = await fs.readFile(siteDataFile, 'utf8');
-      const document = YAML.parseDocument(siteRaw, { prettyErrors: true, uniqueKeys: true });
-      if (document.errors.length) throw httpError(400, `站点数据 YAML 无效：${document.errors[0].message}`);
-      if (hasAvatar) document.set('avatar', values['params.avatar']);
-      if (hasAuthor) document.set('author', values['params.author']);
-      files.push({ target: siteDataFile, content: String(document) });
-    }
-
-    await fileTransaction.replaceFiles(files);
-    return send(res, 200, { ok: true, ...parseToml(raw) });
+    return send(res, 200, await siteSettings.patchSettings(request));
   }
   if (req.method === 'PUT' && pathname === '/api/settings') {
     const request = JSON.parse((await readBody(req)).toString('utf8'));
-    if (typeof request.raw !== 'string' || request.raw.length > maxBodyBytes) return fail(res, 400, '配置内容无效。');
-    await atomicWrite(path.join(repoRoot, 'hugo.toml'), request.raw);
-    scheduleBuild();
-    return send(res, 200, { ok: true });
+    return send(res, 200, await siteSettings.replaceSettingsRaw(request));
   }
   if (req.method === 'GET' && pathname === '/api/modules') {
     const { modules, usage } = await moduleUsage();
