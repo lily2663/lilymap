@@ -54,3 +54,43 @@ test('copyWithoutClobber accepts an identical existing file but rejects conflict
   await fsp.writeFile(source, 'different');
   await assert.rejects(() => service.copyWithoutClobber(source, target), (error) => error.statusCode === 409);
 });
+
+
+test('atomicWrite cleans staged files and preserves destination when rename fails', async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'lilymap-atomic-fault-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const target = path.join(root, 'data', 'value.txt');
+  await fsp.mkdir(path.dirname(target), { recursive: true });
+  await fsp.writeFile(target, 'before');
+
+  let builds = 0;
+  let renameCalls = 0;
+  const fsApi = new Proxy(fsp, {
+    get(targetApi, key) {
+      if (key !== 'rename') {
+        const value = targetApi[key];
+        return typeof value === 'function' ? value.bind(targetApi) : value;
+      }
+      return async (...args) => {
+        renameCalls += 1;
+        const error = Object.assign(new Error('injected rename failure'), { code: 'EPERM' });
+        throw error;
+      };
+    },
+  });
+
+  const service = createAtomicFileService({
+    scheduleBuild: () => { builds += 1; },
+    httpError: (statusCode, message) => Object.assign(new Error(message), { statusCode }),
+    relativeToRepo: (value) => path.relative(root, value).replaceAll('\\', '/'),
+    fsApi,
+  });
+
+  await assert.rejects(() => service.atomicWrite(target, 'after'), /injected rename failure/);
+  assert.equal(renameCalls, 1);
+  assert.equal(builds, 0);
+  assert.equal(await fsp.readFile(target, 'utf8'), 'before');
+
+  const staged = (await fsp.readdir(path.dirname(target))).filter((name) => name.endsWith('.tmp'));
+  assert.deepEqual(staged, []);
+});
