@@ -857,6 +857,7 @@ async function importWallpaperMedia(sourcePath, targetName) {
   const extension = path.extname(source).toLowerCase();
   const kind = mediaKind(source);
   if (!['image', 'video'].includes(kind)) throw httpError(400, '支持 PNG、JPG、WebP、GIF、AVIF、MP4、WebM、MOV、M4V、MKV、AVI。');
+  if (kind === 'image' && stat.size > 64 * 1024 * 1024) throw httpError(413, '图片文件超过 64 MB，已拒绝整文件载入；请先压缩后再导入。');
   const directory = path.join(siteAssetsRoot, kind === 'video' ? 'media' : 'img', 'wallpapers');
   await fs.mkdir(directory, { recursive: true });
   const stamp = `${Date.now()}-${randomUUID().slice(0, 8)}`;
