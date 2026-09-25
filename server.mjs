@@ -14,6 +14,7 @@ import { decryptProtectedBody, encryptProtectedBody } from './src/domain/protect
 import { isObject, parseYaml } from './src/domain/value.mjs';
 import { normalizeLayout, normalizeModuleManifest, parseLayout, serializeLayout, validateLayoutAgainstRegistry } from './src/domain/layout.mjs';
 import { validateFriends, validateProfile } from './src/domain/profile.mjs';
+import { validateMenus, validateThemeSettingsPatch } from './src/domain/theme-config.mjs';
 import { createHttpPrimitives } from './src/http/primitives.mjs';
 import { updateModulePlacement } from './src/domain/module-config.mjs';
 import { isSensitivePublishPath, redactGitCredentials, validatePublishToken } from './src/domain/publish-security.mjs';
@@ -314,8 +315,10 @@ async function lilymapSourceArchive() {
     'src/domain/toml.mjs',
     'src/domain/protected-content.mjs',
     'src/domain/layout.mjs',
+    'src/domain/module-protocol.mjs',
     'src/domain/profile.mjs',
     'src/domain/publish-security.mjs',
+    'src/domain/theme-config.mjs',
     'src/http/primitives.mjs',
     'test/domain.test.mjs',
     'test/http.test.mjs',
@@ -329,7 +332,7 @@ async function lilymapSourceArchive() {
     '.github/theme-compatibility.json', '.github/scripts/update-theme-compatibility.mjs',
     '.github/workflows/validate.yml', '.github/workflows/release.yml', '.github/workflows/theme-compatibility-update.yml',
     'public/index.html', 'public/css/app.css', 'public/css/base.css', 'public/css/refinements.css', 'public/css/workspace.css', 'public/js/app.js',
-    'public/js/core/api.js', 'public/js/core/dom.js', 'public/js/core/state.js',
+    'public/js/core/api.js', 'public/js/core/dom.js', 'public/js/core/state.js', 'public/js/core/value.js',
     'public/css/studio.css', 'public/js/core/icons.js', 'public/js/core/studio.js',
     'public/css/modules.css', 'public/js/features/module-library.js', 'public/js/features/music-module.js', 'public/js/features/module-installer.js',
     'src/domain/module-config.mjs', 'test/module-config.test.mjs',
@@ -464,6 +467,21 @@ async function installSiteModule(request) {
   return { id, manifest };
 }
 
+async function readResponseTextLimited(response, limit) {
+  const declared = Number(response.headers.get('content-length') || 0);
+  if (Number.isFinite(declared) && declared > limit) throw new Error('远程服务返回内容过大，已停止读取。');
+  if (!response.body) return '';
+  const chunks = [];
+  let size = 0;
+  for await (const chunk of response.body) {
+    const bytes = Buffer.from(chunk);
+    size += bytes.length;
+    if (size > limit) throw new Error('远程服务返回内容过大，已停止读取。');
+    chunks.push(bytes);
+  }
+  return Buffer.concat(chunks).toString('utf8');
+}
+
 async function importNeteasePlaylist(request) {
   const playlistInput = String(request?.playlistId || '').trim();
   let playlistId = playlistInput;
@@ -486,19 +504,21 @@ async function importNeteasePlaylist(request) {
         referer: `https://music.163.com/playlist?id=${encodeURIComponent(playlistId)}`,
         'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 LilyMap/1.0',
       },
-      redirect: 'follow',
+      redirect: 'manual',
       signal: AbortSignal.timeout(20000),
     });
   } catch {
     throw new Error('连接网易云超时，请检查网络后重试。');
   }
+  if (response.status >= 300 && response.status < 400) throw new Error('网易云接口返回了重定向；为避免登录 Cookie 被转发到其他地址，已停止导入。');
   if (!response.ok) throw new Error(`网易云返回 HTTP ${response.status}，请稍后重试。`);
-  const contentLength = Number(response.headers.get('content-length') || 0);
-  if (contentLength > 8 * 1024 * 1024) throw new Error('网易云返回内容过大，已停止导入。');
 
   let payload;
-  try { payload = JSON.parse(await response.text()); }
-  catch { throw new Error('网易云返回了无法识别的数据。'); }
+  try { payload = JSON.parse(await readResponseTextLimited(response, 8 * 1024 * 1024)); }
+  catch (error) {
+    if (/内容过大/.test(error.message)) throw error;
+    throw new Error('网易云返回了无法识别的数据。');
+  }
   const playlist = payload?.playlist || payload?.result;
   if (!playlist || !Array.isArray(playlist.tracks)) {
     if (payload?.code === 401 || payload?.code === 20001) {
@@ -1739,14 +1759,18 @@ async function handleApi(req, res, url) {
     return send(res, 200, { raw, ...parseToml(raw), schema });
   }
   if (req.method === 'PATCH' && pathname === '/api/settings') {
-    const request = JSON.parse((await readBody(req)).toString('utf8')); let raw = await fs.readFile(path.join(repoRoot, 'hugo.toml'), 'utf8');
-    for (const [fieldPath, value] of Object.entries(request.values || {})) raw = patchTomlValue(raw, fieldPath, value);
-    if (Array.isArray(request.menus)) raw = patchMenus(raw, request.menus);
+    const request = JSON.parse((await readBody(req)).toString('utf8'));
+    const schema = JSON.parse(await fs.readFile(path.join(themeRoot, 'theme-config.schema.json'), 'utf8'));
+    const values = validateThemeSettingsPatch(schema, request.values || {});
+    const menus = request.menus === undefined ? null : validateMenus(request.menus);
+    let raw = await fs.readFile(path.join(repoRoot, 'hugo.toml'), 'utf8');
+    for (const [fieldPath, value] of Object.entries(values)) raw = patchTomlValue(raw, fieldPath, value);
+    if (menus) raw = patchMenus(raw, menus);
     await atomicWrite(path.join(repoRoot, 'hugo.toml'), raw);
     // The about page renders the avatar from data/site.yaml (hugo.Data.site),
     // so keep it in sync whenever params.avatar changes.
-    const avatar = request.values && request.values['params.avatar'];
-    const author = request.values && request.values['params.author'];
+    const avatar = values['params.avatar'];
+    const author = values['params.author'];
     if ((typeof avatar === 'string' && avatar) || (typeof author === 'string' && author)) {
       const siteRaw = await fs.readFile(siteDataFile, 'utf8');
       const document = YAML.parseDocument(siteRaw, { prettyErrors: true, uniqueKeys: true });
