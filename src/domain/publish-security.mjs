@@ -25,3 +25,11 @@ export function isSensitivePublishPath(value) {
     || normalized === '.backups'
     || normalized.startsWith('.backups/');
 }
+
+
+export function publishPushArguments(branch, { force = false, newRemoteBranch = false, remoteSha = '' } = {}) {
+  const ref = `HEAD:refs/heads/${branch}`;
+  if (!force || newRemoteBranch) return ['push', 'github', ref];
+  if (!/^[0-9a-f]{40}$/i.test(remoteSha)) throw new Error('强制发布缺少有效的远程基线提交。');
+  return ['push', `--force-with-lease=refs/heads/${branch}:${remoteSha}`, 'github', ref];
+}
