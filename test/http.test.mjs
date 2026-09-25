@@ -5,14 +5,20 @@ import { createHttpPrimitives } from '../src/http/primitives.mjs';
 
 const http = createHttpPrimitives({ port: 5174, maxBodyBytes: 1024, maxDecodedImageBytes: 1024 * 1024 });
 
-test('admin write origins are restricted to the local application', () => {
+test('admin host and write origins are restricted to the local application', () => {
+  assert.equal(http.adminHostAllowed({ headers: { host: 'localhost:5174' } }), true);
+  assert.equal(http.adminHostAllowed({ headers: { host: '127.0.0.1:5174' } }), true);
+  assert.equal(http.adminHostAllowed({ headers: { host: 'attacker.example:5174' } }), false);
+  assert.equal(http.adminHostAllowed({ headers: {} }), false);
   assert.equal(http.adminOriginAllowed({ headers: {} }), true);
   assert.equal(http.adminOriginAllowed({ headers: { origin: 'http://localhost:5174', 'sec-fetch-site': 'same-origin' } }), true);
   assert.equal(http.adminOriginAllowed({ headers: { origin: 'https://example.com', 'sec-fetch-site': 'cross-site' } }), false);
 });
 
 test('static security policy distinguishes HTML from inert resources', () => {
-  assert.match(http.staticSecurityHeaders('index.html')['content-security-policy'], /script-src 'self'/);
+  const htmlPolicy = http.staticSecurityHeaders('index.html')['content-security-policy'];
+  assert.match(htmlPolicy, /script-src 'self'/);
+  assert.doesNotMatch(htmlPolicy, /script-src[^;]*unsafe-inline/);
   assert.match(http.staticSecurityHeaders('image.svg')['content-security-policy'], /sandbox/);
 });
 

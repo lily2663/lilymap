@@ -621,7 +621,7 @@ async function resources() {
     pipeline = files.files.filter((f) => f.scope === "pipeline");
   let mediaPreview = (f, source) => {
     if (f.kind === "image") return `<img src="${esc(source)}" alt="" loading="lazy" decoding="async">`;
-    if (f.kind === "video") return `<video src="${esc(source)}" muted loop playsinline preload="metadata" onpointerenter="this.play()" onpointerleave="this.pause()"></video>`;
+    if (f.kind === "video") return `<video src="${esc(source)}" muted loop playsinline preload="metadata"></video>`;
     return `<div class="file-badge">${esc(f.extension || "file")}</div>`;
   };
   let siteCards =
@@ -643,6 +643,10 @@ async function resources() {
     ) +
     `<section class="section"><div class="security-note"><span aria-hidden="true">✓</span><p><strong>路径规则已统一</strong>磁盘位置是 static/assets/...；Hugo 与线上使用 /assets/...。源码管线 assets/ 不再伪装成可直接访问 URL。</p></div><h2>站点资源</h2><p class="muted">可以上传、替换、重命名或移入回收区。重命名及删除前请检查文章和配置中的引用。</p><label class="upload-btn btn primary">+ 上传图片<input id="res-upload" type="file" accept="image/png,image/jpeg,image/webp,image/gif,image/avif" multiple hidden></label><div class="asset-grid">${siteCards}</div></section>${pipeline.length ? `<section class="section"><h2>Hugo 资源管线（不直接公开）</h2><div class="security-note"><span aria-hidden="true">i</span><p><strong>${pipeline.length} 个 assets/ 源文件</strong>这些文件需要模板处理后才有 URL，LilyMap 不再生成误导性的公开路径。</p></div></section>` : ""}<section class="section"><h2>文章图片</h2>${article.length ? `<div class="asset-grid">${article.map((f) => `<div class="asset-card"><div class="asset-prev">${mediaPreview(f, "/" + f.path)}</div><div class="asset-meta"><b>${esc(f.path.split("/").pop())}</b><span class="path">${esc(Object.entries(bundles).find(([d]) => f.path.startsWith(d + "/"))?.[1]?.title || f.path)}</span><div class="asset-actions"><button class="btn mini" data-copy="${esc(f.path.split("/").pop())}">复制文件名</button>${f.kind === 'image' ? `<button class="btn mini" data-file-action="replace" data-file-path="${esc(f.path)}">替换</button><button class="btn mini" data-file-action="rename" data-file-path="${esc(f.path)}">重命名</button><button class="btn mini danger" data-file-action="delete" data-file-path="${esc(f.path)}">删除</button>` : ''}</div></div></div>`).join("")}</div>` : '<div class="empty">尚未发现 Page Bundle 图片。</div>'}</section>`;
   bindCommon();
+  document.querySelectorAll(".asset-prev video").forEach((video) => {
+    video.addEventListener("pointerenter", () => { void video.play().catch(() => {}); });
+    video.addEventListener("pointerleave", () => video.pause());
+  });
   document
     .querySelectorAll("[data-copy]")
     .forEach((b) => (b.onclick = () => state.resCopy(b.dataset.copy)));

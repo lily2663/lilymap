@@ -9,3 +9,19 @@ export function redactGitCredentials(value, token = '') {
   if (token) detail = detail.split(token).join('[REDACTED]');
   return detail.replace(/https:\/\/[^\s@]+@github\.com/gi, 'https://[REDACTED]@github.com');
 }
+
+export function isSensitivePublishPath(value) {
+  const normalized = String(value || '').trim().replaceAll('\\', '/').replace(/^\.\//, '');
+  return normalized === '.token'
+    || normalized === '.lilymap-local.json'
+    || normalized === 'lilymap.json'
+    || normalized === 'hugo-desk.json'
+    || normalized === '.secrets'
+    || normalized.startsWith('.secrets/')
+    || normalized === 'private-content'
+    || normalized.startsWith('private-content/')
+    || normalized === '.admin-trash'
+    || normalized.startsWith('.admin-trash/')
+    || normalized === '.backups'
+    || normalized.startsWith('.backups/');
+}
