@@ -934,6 +934,8 @@ async function handleApi(req, res, url) {
     const destination = path.join(contentRoot, 'posts', plan.slug);
     if (await exists(destination)) return fail(res, 409, '目标文章目录已存在。');
     await fs.mkdir(destination, { recursive: true });
+    const createdStatic = [];
+    const publicSnapshots = [];
     try {
       // 先验证会写入的 static 资源，防止导入完成一半才发现同名文件冲突。
       for (const copy of plan.staticCopies || []) {
@@ -958,12 +960,26 @@ async function handleApi(req, res, url) {
       for (const copy of plan.staticCopies || []) {
         const dest = inside(repoRoot, copy.to);
         if (!dest) continue;
-        await copyWithoutClobber(copy.from, dest);
+        const copyResult = await copyWithoutClobber(copy.from, dest);
+        if (copyResult === 'created') createdStatic.push(dest);
+
         const publicDest = path.join(repoRoot, 'public', ...copy.to.replace(/^static\//, '').split('/'));
+        const previousPublic = await fs.readFile(publicDest).then((bytes) => ({ existed: true, bytes })).catch((error) => {
+          if (error?.code === 'ENOENT') return { existed: false, bytes: null };
+          throw error;
+        });
+        publicSnapshots.push({ target: publicDest, ...previousPublic });
         await atomicWrite(publicDest, await fs.readFile(copy.from), { schedule: false });
       }
       scheduleBuild();
     } catch (error) {
+      for (const snapshot of publicSnapshots.reverse()) {
+        try {
+          if (snapshot.existed) await atomicWrite(snapshot.target, snapshot.bytes, { schedule: false });
+          else await fs.rm(snapshot.target, { force: true });
+        } catch {}
+      }
+      await Promise.all(createdStatic.map((target) => fs.rm(target, { force: true }).catch(() => {})));
       await fs.rename(destination, path.join(trashRoot, `failed-import-${randomUUID()}`)).catch(() => {});
       throw error;
     }
