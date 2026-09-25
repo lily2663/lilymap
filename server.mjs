@@ -12,6 +12,7 @@ import { createFileTransactionService } from './src/fs/file-transaction.mjs';
 import { createLilyMapSourceArchive } from './src/services/source-archive.mjs';
 import { createBuildService } from './src/services/build-service.mjs';
 import { createImportPlanner } from './src/services/import-planner.mjs';
+import { createImportService } from './src/services/import-service.mjs';
 import { createGitService } from './src/services/git-service.mjs';
 import { createPublishService } from './src/services/publish-service.mjs';
 import { createSiteSettingsService } from './src/services/site-settings-service.mjs';
@@ -735,6 +736,20 @@ const { stageFile, atomicWrite, atomicCreate, copyWithoutClobber } = createAtomi
   relativeToRepo,
 });
 
+const importService = createImportService({
+  repoRoot,
+  contentRoot,
+  trashRoot,
+  uploadImageExtensions,
+  prepareImport,
+  hasExpectedImageSignature,
+  atomicWrite,
+  atomicCreate,
+  copyWithoutClobber,
+  scheduleBuild,
+  httpError,
+});
+
 const mediaService = createMediaService({
   repoRoot,
   siteAssetsRoot,
@@ -789,91 +804,18 @@ async function handleApi(req, res, url) {
   if (req.method === 'POST' && pathname === '/api/import/inspect') {
     try {
       const request = JSON.parse((await readBody(req, 20 * 1024 * 1024)).toString('utf8'));
-      const plan = await prepareImport(request);
-      return send(res, 200, { ...plan, raw: undefined, assetCount: plan.assets.length, rewriteCount: (plan.rewrites || []).length });
-    } catch (error) { return fail(res, 400, error.message || '导入内容无效。'); }
+      return send(res, 200, await importService.inspect(request));
+    } catch (error) {
+      return fail(res, Number.isInteger(error.statusCode) ? error.statusCode : 400, error.message || '导入内容无效。');
+    }
   }
   if (req.method === 'POST' && pathname === '/api/import') {
-    let plan;
     try {
       const request = JSON.parse((await readBody(req, 20 * 1024 * 1024)).toString('utf8'));
-      plan = await prepareImport(request);
-    } catch (error) { return fail(res, 400, error.message || '导入内容无效。'); }
-    const destination = path.join(contentRoot, 'posts', plan.slug);
-    if (await exists(destination)) return fail(res, 409, '目标文章目录已存在。');
-    await fs.mkdir(destination, { recursive: true });
-    const createdStatic = [];
-    const publicSnapshots = [];
-    try {
-      // 先验证会写入的 static 资源，防止导入完成一半才发现同名文件冲突。
-      for (const copy of plan.staticCopies || []) {
-        const dest = inside(repoRoot, copy.to);
-        if (!dest) throw new Error('资源路径不安全。');
-        if (await exists(dest)) {
-          const sourceBytes = await fs.readFile(copy.from);
-          const currentBytes = await fs.readFile(dest);
-          if (!currentBytes.equals(sourceBytes)) throw httpError(409, `目标资源已存在且内容不同：${relativeToRepo(dest)}。`);
-        }
-      }
-      await atomicWrite(path.join(destination, 'index.md'), plan.raw, { schedule: false });
-      for (const asset of plan.assets) {
-        const relative = asset.targetParts.join('/');
-        if (!relative || relative.startsWith('..') || path.isAbsolute(relative)) throw new Error('资源路径不安全。');
-        const target = inside(destination, relative);
-        if (!target || !uploadImageExtensions.has(path.extname(target).toLowerCase())) continue;
-        const bytes = asset.diskPath ? await fs.readFile(asset.diskPath) : Buffer.from(String(asset.content || ''), 'base64');
-        if (!hasExpectedImageSignature(bytes, path.extname(target))) throw new Error(`图片 ${path.basename(target)} 的内容与扩展名不匹配或已损坏。`);
-        await atomicCreate(target, bytes);
-      }
-      for (const copy of plan.staticCopies || []) {
-        const dest = inside(repoRoot, copy.to);
-        if (!dest) continue;
-        const copyResult = await copyWithoutClobber(copy.from, dest);
-        if (copyResult === 'created') createdStatic.push(dest);
-
-        const publicDest = path.join(repoRoot, 'public', ...copy.to.replace(/^static\//, '').split('/'));
-        const previousPublic = await fs.readFile(publicDest).then((bytes) => ({ existed: true, bytes })).catch((error) => {
-          if (error?.code === 'ENOENT') return { existed: false, bytes: null };
-          throw error;
-        });
-        publicSnapshots.push({ target: publicDest, ...previousPublic });
-        await atomicWrite(publicDest, await fs.readFile(copy.from), { schedule: false });
-      }
-      scheduleBuild();
+      return send(res, 201, await importService.importRequest(request));
     } catch (error) {
-      for (const snapshot of publicSnapshots.reverse()) {
-        try {
-          if (snapshot.existed) await atomicWrite(snapshot.target, snapshot.bytes, { schedule: false });
-          else await fs.rm(snapshot.target, { force: true });
-        } catch {}
-      }
-      await Promise.all(createdStatic.map((target) => fs.rm(target, { force: true }).catch(() => {})));
-      await fs.rename(destination, path.join(trashRoot, `failed-import-${randomUUID()}`)).catch(() => {});
-      throw error;
+      return fail(res, Number.isInteger(error.statusCode) ? error.statusCode : 400, error.message || '导入失败。');
     }
-    return send(res, 201, { ok: true, path: relativeToRepo(path.join(destination, 'index.md')), assetCount: plan.assets.length, missing: plan.missing, rewriteCount: (plan.rewrites || []).length });
-  }
-  if (req.method === 'GET' && pathname === '/api/status') {
-    const [changes, branch, head, blog, mediaTools] = await Promise.all([gitChanges(), git(['branch', '--show-current']), git(['log', '-1', '--format=%h%x00%s%x00%aI']), blogStatus(), mediaToolsStatus()]);
-    const postCount = (await listPosts(changes)).filter((post) => post.path.startsWith('content/posts/')).length;
-    return send(res, 200, {
-      apiVersion: 6,
-      repoRoot,
-      paths: {
-        repository: repoRoot,
-        content: contentRoot,
-        static: staticRoot,
-        siteAssets: siteAssetsRoot,
-        public: hugoPublicRoot,
-        publicAssetPrefix: '/assets/',
-      },
-      theme: { name: themeName, root: themeRoot, compatible: await exists(path.join(themeRoot, 'theme-config.schema.json')) },
-      hugo: { executable: hugoExecutable, source: hugoSource, bundled: await exists(bundledHugoExecutable) },
-      mediaTools,
-      branch: branch.stdout.trim(), changes, postCount, blogUrl: blog.url, blogLanUrl: blog.lanUrl,
-      blogRunning: blog.running, blogStatus: blog.status, preview: blog, build: buildSnapshot(),
-      head: head.stdout.trim().split('\0'),
-    });
   }
   if (req.method === 'GET' && pathname === '/api/posts') return send(res, 200, { posts: await listPosts() });
   if (req.method === 'GET' && pathname === '/api/admin/export') {
