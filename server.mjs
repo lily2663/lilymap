@@ -1769,14 +1769,14 @@ async function handleApi(req, res, url) {
     await atomicWrite(path.join(repoRoot, 'hugo.toml'), raw);
     // The about page renders the avatar from data/site.yaml (hugo.Data.site),
     // so keep it in sync whenever params.avatar changes.
-    const avatar = values['params.avatar'];
-    const author = values['params.author'];
-    if ((typeof avatar === 'string' && avatar) || (typeof author === 'string' && author)) {
+    const hasAvatar = Object.hasOwn(values, 'params.avatar');
+    const hasAuthor = Object.hasOwn(values, 'params.author');
+    if (hasAvatar || hasAuthor) {
       const siteRaw = await fs.readFile(siteDataFile, 'utf8');
       const document = YAML.parseDocument(siteRaw, { prettyErrors: true, uniqueKeys: true });
       if (document.errors.length) throw httpError(400, `站点数据 YAML 无效：${document.errors[0].message}`);
-      if (typeof avatar === 'string' && avatar) document.set('avatar', avatar);
-      if (typeof author === 'string' && author) document.set('author', author);
+      if (hasAvatar) document.set('avatar', values['params.avatar']);
+      if (hasAuthor) document.set('author', values['params.author']);
       await atomicWrite(siteDataFile, String(document));
     }
     scheduleBuild();
