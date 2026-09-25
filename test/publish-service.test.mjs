@@ -56,3 +56,86 @@ test('publish service persists local target and token without exposing them thro
   assert.equal(await service.tokenPresent(), true);
   assert.ok(calls.every((args) => !args.join(' ').includes(token)));
 });
+
+
+async function publishFixture(t, {
+  pushResult = { code: 0, stdout: '', stderr: '' },
+  remoteAfterPush,
+} = {}) {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'lilymap-publish-flow-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+
+  const remote = 'https://github.com/lily/site.git';
+  const branch = 'main';
+  const oldSha = '1'.repeat(40);
+  const localSha = '2'.repeat(40);
+  const token = 'ghp_123456789012345678901234567890';
+  await fsp.writeFile(path.join(root, '.token'), token);
+  await fsp.writeFile(path.join(root, '.lilymap-local.json'), JSON.stringify({ publishRemote: remote, publishBranch: branch }));
+
+  const gitCalls = [];
+  const networkCalls = [];
+  const ok = (stdout = '') => ({ code: 0, stdout, stderr: '' });
+
+  const git = async (args) => {
+    gitCalls.push(args);
+    const key = args.join(' ');
+    if (key === 'remote get-url github') return ok(remote + '\n');
+    if (key.startsWith('ls-files -- ')) return ok('');
+    if (key.startsWith('add -A -- .')) return ok('');
+    if (key === 'diff --cached --name-only --') return ok('');
+    if (key === 'diff --cached --quiet') return ok('');
+    if (key === 'rev-parse FETCH_HEAD') return ok(oldSha + '\n');
+    if (key === 'rev-list --count FETCH_HEAD --not HEAD') return ok('0\n');
+    if (key === 'rev-parse HEAD') return ok(localSha + '\n');
+    throw new Error(`unexpected git call: ${key}`);
+  };
+
+  const gitNetwork = async (args) => {
+    networkCalls.push(args);
+    const key = args.join(' ');
+    if (key === 'fetch github main') return ok('');
+    if (args[0] === 'push') return pushResult;
+    if (key === 'ls-remote github refs/heads/main') {
+      const sha = remoteAfterPush ?? localSha;
+      return ok(sha ? `${sha}\trefs/heads/main\n` : '');
+    }
+    throw new Error(`unexpected network git call: ${key}`);
+  };
+
+  const service = createPublishService({
+    repoRoot: root,
+    trashRoot: path.join(root, '.admin-trash'),
+    exists: async (target) => fsp.access(target).then(() => true).catch(() => false),
+    atomicWrite: async (target, content) => fsp.writeFile(target, content),
+    git,
+    gitNetwork,
+    safeGitFailure: () => 'sanitized failure',
+  });
+
+  return { service, gitCalls, networkCalls, localSha, oldSha, token };
+}
+
+test('publish reconciles an ambiguous push failure when remote already equals local HEAD', async (t) => {
+  const fixture = await publishFixture(t, {
+    pushResult: { code: 1, stdout: '', stderr: 'connection reset after send-pack' },
+  });
+
+  const result = await fixture.service.publishToBlog('', false);
+  assert.equal(result.reconciledAfterAmbiguousFailure, true);
+  assert.match(result.message, /main/);
+  assert.ok(fixture.networkCalls.some((args) => args[0] === 'ls-remote'));
+  assert.ok(fixture.networkCalls.every((args) => !args.join(' ').includes(fixture.token)));
+});
+
+test('publish keeps a failed result when remote does not match local HEAD after push error', async (t) => {
+  const fixture = await publishFixture(t, {
+    pushResult: { code: 1, stdout: '', stderr: 'connection reset' },
+    remoteAfterPush: '3'.repeat(40),
+  });
+
+  await assert.rejects(
+    () => fixture.service.publishToBlog('', false),
+    /push 失败：sanitized failure/,
+  );
+});
