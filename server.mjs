@@ -20,6 +20,7 @@ import { createMediaService, mediaKind as classifyMedia } from './src/services/m
 import { createNetworkAdapter } from './src/services/network-adapter.mjs';
 import { createNeteaseService } from './src/services/netease-service.mjs';
 import { createLayoutModuleService } from './src/services/layout-module-service.mjs';
+import { createResourceService } from './src/services/resource-service.mjs';
 import { safeSlug } from './src/domain/slug.mjs';
 import YAML from 'yaml';
 import { formatYamlValue, parseFrontMatter, patchFrontMatter } from './src/domain/front-matter.mjs';
@@ -35,6 +36,7 @@ import { createMediaRoutes } from './src/http/routes/media-routes.mjs';
 import { createNeteaseRoutes } from './src/http/routes/netease-routes.mjs';
 import { createPublishRoutes } from './src/http/routes/publish-routes.mjs';
 import { createLayoutModuleRoutes } from './src/http/routes/layout-module-routes.mjs';
+import { createResourceRoutes } from './src/http/routes/resource-routes.mjs';
 import { updateModulePlacement } from './src/domain/module-config.mjs';
 
 // esbuild 打包成 cjs 后 __dirname 可用；dev 模式（node 直接跑 ESM）下 __dirname 不存在，
@@ -202,47 +204,7 @@ function repoPath(relative, allowedRoots = [contentRoot]) {
   return null;
 }
 
-function managedResourcePath(relative) {
-  const target = repoPath(relative, [siteAssetsRoot, path.join(contentRoot, 'posts')]);
-  if (!target || !['image', 'video'].includes(mediaKind(target))) return null;
-  if (target.startsWith(`${path.join(contentRoot, 'posts')}${path.sep}`)) {
-    const parts = path.relative(path.join(contentRoot, 'posts'), target).split(path.sep);
-    if (parts.length !== 2 || !uploadImageExtensions.has(path.extname(target).toLowerCase())) return null;
-  }
-  return target;
-}
-
 function relativeToRepo(target) { return path.relative(repoRoot, target).split(path.sep).join('/'); }
-
-function publicPathForRepoFile(target) {
-  const resolved = path.resolve(target);
-  if (resolved === staticRoot || resolved.startsWith(`${staticRoot}${path.sep}`)) {
-    const relative = path.relative(staticRoot, resolved).split(path.sep).join('/');
-    return relative ? `/${relative}` : '/';
-  }
-  return null;
-}
-
-function canonicalAssetDirectory(rawArea = 'static/assets/img') {
-  let normalized = String(rawArea || '').trim().replaceAll('\\', '/').replace(/^\/+|\/+$/g, '');
-  // 旧版 LilyMap 曾把 assets/ 当成可直接访问目录；继续接受旧输入，
-  // 但统一重定向到 Hugo 真正公开的 static/assets/，杜绝“配置有 URL、线上无文件”。
-  normalized = normalized.replace(/^static\//, '');
-  if (normalized === 'assets') normalized = 'assets/img';
-  if (!normalized.startsWith('assets/')) return null;
-  const parts = normalized.split('/').filter(Boolean);
-  if (parts.some((part) => part === '.' || part === '..' || !/^[\p{L}\p{N}._-]+$/u.test(part))) return null;
-  return inside(staticRoot, parts.join(path.sep));
-}
-
-function safeMediaStem(value, fallback = 'media') {
-  const stem = path.parse(path.basename(String(value || ''))).name
-    .normalize('NFKC')
-    .replace(/[^\p{L}\p{N}._-]+/gu, '-')
-    .replace(/^-+|-+$/g, '')
-    .slice(0, 72);
-  return stem || fallback;
-}
 
 async function exists(target) { try { await fs.access(target); return true; } catch { return false; } }
 
@@ -408,6 +370,22 @@ const {
   importUploadedVideo,
 } = mediaService;
 
+const resourceService = createResourceService({
+  repoRoot,
+  contentRoot,
+  staticRoot,
+  siteAssetsRoot,
+  trashRoot,
+  uploadImageExtensions,
+  mediaKind,
+  hasExpectedImageSignature,
+  atomicCreate,
+  atomicWrite,
+  scheduleBuild,
+  syncStaticPreview,
+  inspectMedia,
+});
+
 const network = createNetworkAdapter();
 
 const fileTransaction = createFileTransactionService({
@@ -483,6 +461,13 @@ const publishRoutes = createPublishRoutes({
   exists,
 });
 const layoutModuleRoutes = createLayoutModuleRoutes({ readBody, send, fail, layoutModules });
+const resourceRoutes = createResourceRoutes({
+  readBody,
+  send,
+  fail,
+  resourceService,
+  maxMediaBodyBytes,
+});
 
 async function handleApi(req, res, url) {
   const pathname = url.pathname;
@@ -495,6 +480,7 @@ async function handleApi(req, res, url) {
   if (await neteaseRoutes(req, res, url)) return;
   if (await publishRoutes(req, res, url)) return;
   if (await layoutModuleRoutes(req, res, url)) return;
+  if (await resourceRoutes(req, res, url)) return;
   if (req.method === 'GET' && pathname === '/api/posts') return send(res, 200, { posts: await listPosts() });
   if (req.method === 'GET' && pathname === '/api/admin/export') {
     const archive = await createLilyMapSourceArchive({ repoRoot, adminDir });
@@ -703,73 +689,6 @@ async function handleApi(req, res, url) {
     catch (error) { if (error.statusCode === 409) return fail(res, 409, error.message); throw error; }
     scheduleBuild();
     return send(res, 201, { ok: true, markdown: `![${path.parse(name).name}](${name})`, path: relativeToRepo(destination) });
-  }
-  if (req.method === 'POST' && pathname === '/api/asset/upload') {
-    const name = path.basename(url.searchParams.get('name') || '');
-    const area = String(url.searchParams.get('area') || 'static/assets/img');
-    if (!name || !uploadImageExtensions.has(path.extname(name).toLowerCase())) return fail(res, 400, '仅允许上传 PNG、JPG、WebP、GIF 或 AVIF 图片资源。');
-    const dirInRepo = canonicalAssetDirectory(area);
-    if (!dirInRepo) return fail(res, 400, '站点资源统一写入 static/assets，请选择该目录下的安全子目录。');
-    await fs.mkdir(dirInRepo, { recursive: true });
-    const bytes = await readBody(req, 24 * 1024 * 1024);
-    if (!hasExpectedImageSignature(bytes, path.extname(name))) return fail(res, 400, '图片内容与扩展名不匹配或文件已损坏。');
-    const sourcePath = path.join(dirInRepo, name);
-    await atomicCreate(sourcePath, bytes);
-    const preview = await syncStaticPreview(sourcePath);
-    return send(res, 201, { ok: true, path: publicPathForRepoFile(sourcePath), file: relativeToRepo(sourcePath), ...preview });
-  }
-  if (req.method === 'GET' && pathname === '/api/files') {
-    const roots = [contentRoot, staticRoot, path.join(repoRoot, 'assets'), path.join(repoRoot, 'data')];
-    const availableRoots = [];
-    for (const root of roots) if (await exists(root)) availableRoots.push(root);
-    const files = (await Promise.all(availableRoots.map(async (root) => walk(root, () => true)))).flat();
-    const entries = await Promise.all(files.map(async (file) => {
-      const stat = await fs.stat(file);
-      const relative = relativeToRepo(file);
-      return {
-        path: relative,
-        publicPath: publicPathForRepoFile(file),
-        scope: relative.startsWith('static/') ? 'public' : relative.startsWith('assets/') ? 'pipeline' : relative.startsWith('content/') ? 'content' : 'data',
-        kind: mediaKind(file),
-        size: stat.size,
-        modifiedAt: stat.mtime.toISOString(),
-        extension: path.extname(file).slice(1).toLowerCase(),
-      };
-    }));
-    return send(res, 200, { files: entries.sort((a, b) => a.path.localeCompare(b.path)) });
-  }
-  if (['PUT', 'PATCH', 'DELETE'].includes(req.method) && pathname === '/api/file') {
-    const target = managedResourcePath(url.searchParams.get('path'));
-    if (!target || !(await exists(target)) || !(await fs.stat(target)).isFile()) return fail(res, 404, '可管理的图片或视频不存在。');
-    if (req.method === 'PATCH') {
-      const request = JSON.parse((await readBody(req, 4096)).toString('utf8'));
-      const name = String(request.name || '').trim();
-      if (!name || path.basename(name) !== name || !/^[\p{L}\p{N}._-]+$/u.test(name) || path.extname(name).toLowerCase() !== path.extname(target).toLowerCase()) return fail(res, 400, '新文件名无效；请保持原扩展名。');
-      const destination = path.join(path.dirname(target), name);
-      if (await exists(destination)) return fail(res, 409, '新文件名已存在。');
-      await fs.rename(target, destination);
-      scheduleBuild();
-      return send(res, 200, { ok: true, path: relativeToRepo(destination) });
-    }
-    const backup = path.join(trashRoot, 'resources', `${randomUUID()}-${path.basename(target)}`);
-    await fs.mkdir(path.dirname(backup), { recursive: true });
-    if (req.method === 'DELETE') {
-      await fs.rename(target, backup);
-      scheduleBuild();
-      return send(res, 200, { ok: true, trashedTo: relativeToRepo(backup) });
-    }
-    const bytes = await readBody(req, mediaKind(target) === 'video' ? maxMediaBodyBytes : 24 * 1024 * 1024);
-    if (mediaKind(target) === 'image' && !hasExpectedImageSignature(bytes, path.extname(target))) return fail(res, 400, '新图片内容与原扩展名不匹配。');
-    if (mediaKind(target) === 'video') {
-      if (path.extname(target).toLowerCase() !== '.mp4') return fail(res, 400, '视频替换目前只支持 MP4；其他格式可先上传新文件。');
-      const probeFile = path.join(trashRoot, 'resources', `${randomUUID()}.mp4`);
-      await fs.writeFile(probeFile, bytes, { flag: 'wx' });
-      try { await inspectMedia(probeFile); } finally { await fs.rm(probeFile, { force: true }); }
-    }
-    await fs.rename(target, backup);
-    try { await atomicWrite(target, bytes); }
-    catch (error) { await fs.rename(backup, target).catch(() => {}); throw error; }
-    return send(res, 200, { ok: true, backup: relativeToRepo(backup) });
   }
   if (req.method === 'GET' && pathname === '/api/git/diff') {
     const target = url.searchParams.get('path');
