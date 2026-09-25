@@ -12,6 +12,7 @@ import { createLilyMapSourceArchive } from './src/services/source-archive.mjs';
 import { createBuildService } from './src/services/build-service.mjs';
 import { createImportPlanner } from './src/services/import-planner.mjs';
 import { createGitService } from './src/services/git-service.mjs';
+import { createPublishService } from './src/services/publish-service.mjs';
 import { safeSlug } from './src/domain/slug.mjs';
 import YAML from 'yaml';
 import { formatYamlValue, parseFrontMatter, patchFrontMatter } from './src/domain/front-matter.mjs';
@@ -24,7 +25,6 @@ import { validateMenus, validateThemeSettingsPatch } from './src/domain/theme-co
 import { createHttpPrimitives } from './src/http/primitives.mjs';
 import { streamFile } from './src/http/static-files.mjs';
 import { updateModulePlacement } from './src/domain/module-config.mjs';
-import { isSensitivePublishPath, publishPushArguments, validatePublishToken } from './src/domain/publish-security.mjs';
 
 // esbuild 打包成 cjs 后 __dirname 可用；dev 模式（node 直接跑 ESM）下 __dirname 不存在，
 // 用 import.meta.url 兜底推导。
@@ -793,121 +793,6 @@ async function importWallpaperMedia(sourcePath, targetName) {
   };
 }
 
-const localConfigFile = path.join(repoRoot, '.lilymap-local.json');
-function validBlogRemote(value) {
-  return typeof value === 'string' && /^https:\/\/github\.com\/[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+(?:\.git)?$/.test(value);
-}
-function validPublishBranch(value) {
-  return typeof value === 'string' && /^[A-Za-z0-9][A-Za-z0-9._/-]{0,99}$/.test(value)
-    && !value.includes('..') && !value.includes('//') && !value.endsWith('/') && !value.endsWith('.lock');
-}
-async function readPublishConfig() {
-  if (!(await exists(localConfigFile))) return {};
-  return JSON.parse(await fs.readFile(localConfigFile, 'utf8'));
-}
-async function publishRemote() {
-  const config = await readPublishConfig();
-  if (validBlogRemote(config.publishRemote)) return config.publishRemote;
-  const current = await git(['remote', 'get-url', 'github']);
-  return current.code === 0 && validBlogRemote(current.stdout.trim()) ? current.stdout.trim() : '';
-}
-async function publishBranch() {
-  const config = await readPublishConfig();
-  return validPublishBranch(config.publishBranch) ? config.publishBranch : 'main';
-}
-
-async function findTokenFile() {
-  const candidates = [path.join(repoRoot, '.token')];
-  for (const candidate of candidates) if (await exists(candidate)) return candidate;
-  return null;
-}
-
-async function ensureBlogRemote(expected) {
-  if (!validBlogRemote(expected)) throw new Error('尚未设置有效的 GitHub 发布目标。');
-  const current = await git(['remote', 'get-url', 'github']);
-  if (current.code === 0) {
-    const url = current.stdout.trim();
-    if (url.toLowerCase().replace(/\.git$/, '') !== expected.toLowerCase().replace(/\.git$/, '')) throw new Error(`github 远程与 LilyMap 发布目标不一致：${url}`);
-    return;
-  }
-  const add = await git(['remote', 'add', 'github', expected]);
-  if (add.code !== 0) throw new Error(`无法添加 github 远程：${add.stderr.trim()}`);
-}
-
-async function publishToBlog(commitMessage, force, report = () => {}) {
-  report(5, '正在检查 GitHub 凭据');
-  const tokenFile = await findTokenFile();
-  if (!tokenFile) throw new Error('未找到 GitHub 认证 token（.token）。');
-  const token = (await fs.readFile(tokenFile, 'utf8')).trim();
-  if (!token) throw new Error('token 为空。');
-  report(12, '正在确认目标仓库');
-  await ensureBlogRemote(await publishRemote());
-  const targetBranch = await publishBranch();
-  report(20, '正在整理本地变更');
-  const trackedLocal = await git(['ls-files', '--', '.token', '.lilymap-local.json', 'lilymap.json', 'hugo-desk.json', '.secrets', 'private-content', '.admin-trash', '.backups']);
-  if (trackedLocal.code !== 0) throw new Error(`无法检查本机敏感文件：${trackedLocal.stderr.trim()}`);
-  const trackedSensitive = trackedLocal.stdout.split(/\r?\n/).filter(Boolean).filter(isSensitivePublishPath);
-  if (trackedSensitive.length) throw new Error(`检测到不应进入 Git 的本机文件：${trackedSensitive.slice(0, 5).join(', ')}。请先从 Git 索引移除后再发布。`);
-  const add = await git(['add', '-A', '--', '.',
-    ':(exclude).token', ':(exclude).lilymap-local.json', ':(exclude)lilymap.json', ':(exclude)hugo-desk.json',
-    ':(exclude).secrets/**', ':(exclude)private-content/**', ':(exclude).admin-trash/**', ':(exclude).backups/**',
-  ]);
-  if (add.code !== 0) throw new Error(`git add 失败：${add.stderr.trim()}`);
-  const stagedNames = await git(['diff', '--cached', '--name-only', '--']);
-  if (stagedNames.code !== 0) throw new Error(`无法检查暂存区：${stagedNames.stderr.trim()}`);
-  const stagedSensitive = stagedNames.stdout.split(/\r?\n/).filter(Boolean).filter(isSensitivePublishPath);
-  if (stagedSensitive.length) throw new Error(`暂存区包含本机敏感文件，已拒绝发布：${stagedSensitive.slice(0, 5).join(', ')}。`);
-  const staged = await git(['diff', '--cached', '--quiet']);
-  report(30, staged.code !== 0 ? '正在创建本次提交' : '没有新文件需要提交');
-  if (staged.code !== 0) {
-    // 默认英文 conventional commit；用户可在发布界面自定义（UTF-8 临时文件 -F 提交，避免 Windows 编码丢失）
-    const message = String(commitMessage || '').slice(0, 200).trim() || 'chore: publish blog updates';
-    const msgFile = path.join(trashRoot, `commit-msg-${Date.now()}.txt`);
-    await fs.mkdir(trashRoot, { recursive: true });
-    await fs.writeFile(msgFile, message, 'utf8');
-    // 不覆盖 user.name/user.email，使用仓库/全局配置的真实身份提交
-    const commit = await git(['-c', 'i18n.commitencoding=utf-8', 'commit', '-F', msgFile]);
-    await fs.rm(msgFile, { force: true }).catch(() => {});
-    if (commit.code !== 0) throw new Error(`git commit 失败：${commit.stderr.trim()}`);
-  }
-  const authConfig = [[`url.https://oauth2:${token}@github.com/.insteadOf`, 'https://github.com/']];
-  // Keep credentials and proxy values out of the process command line. Git reads
-  // one-shot config from the child environment instead, and errors are still redacted.
-  // Reconcile remote-first changes (e.g. edits made directly on GitHub web)
-  // so a stale local branch never blocks publishing with a non-fast-forward.
-  report(46, '正在获取 GitHub 上的最新版本');
-  const fetch = await gitNetwork(['fetch', 'github', targetBranch], authConfig);
-  let newRemoteBranch = false;
-  if (fetch.code !== 0 && force) {
-    const probe = await gitNetwork(['ls-remote', 'github', `refs/heads/${targetBranch}`], authConfig);
-    newRemoteBranch = probe.code === 0 && !probe.stdout.trim();
-  }
-  if (fetch.code !== 0 && !newRemoteBranch) throw new Error(`git fetch 失败：${safeGitFailure(fetch, token)}`);
-  let remoteSha = '';
-  if (!newRemoteBranch) {
-    const remoteHead = await git(['rev-parse', 'FETCH_HEAD']);
-    remoteSha = remoteHead.code === 0 ? remoteHead.stdout.trim() : '';
-    if (!/^[0-9a-f]{40}$/i.test(remoteSha)) throw new Error('无法确定远程分支基线，已停止发布。');
-  }
-  if (!newRemoteBranch && !force) {
-    report(64, '正在检查远程差异');
-    const remoteOnly = await git(['rev-list', '--count', 'FETCH_HEAD', '--not', 'HEAD']);
-    if (Number(remoteOnly.stdout.trim() || '0') > 0) {
-      report(73, '正在安全整合远程修改');
-      const rebase = await git(['rebase', 'FETCH_HEAD']);
-      if (rebase.code !== 0) {
-        await git(['rebase', '--abort']);
-        throw new Error('远程包含与本地冲突的修改，已安全中止。请先在 GitHub 上查看远程改动再发布。');
-      }
-    }
-  }
-  report(86, force ? '正在使用远程租约安全替换当前源码' : '正在推送到 GitHub');
-  const push = await gitNetwork(publishPushArguments(targetBranch, { force, newRemoteBranch, remoteSha }), authConfig);
-  if (push.code !== 0) throw new Error(`push 失败：${safeGitFailure(push, token)}`);
-  report(100, '源码已推送，GitHub Actions 正在构建');
-  return { message: commitMessage ? `已推送 ${commitMessage}` : `已推送到 ${targetBranch} 分支` };
-}
-
 // 博客预览由 admin server 自己托管 public/（见底部 blogServer），
 // 不再探测外部 hugo server，因此恒为运行中。
 const blogHost = process.env.BLOG_HOST || '0.0.0.0';
@@ -1006,6 +891,16 @@ const { atomicWrite, atomicCreate, copyWithoutClobber } = createAtomicFileServic
   scheduleBuild,
   httpError,
   relativeToRepo,
+});
+
+const publishService = createPublishService({
+  repoRoot,
+  trashRoot,
+  exists,
+  atomicWrite,
+  git,
+  gitNetwork,
+  safeGitFailure,
 });
 
 async function handleApi(req, res, url) {
@@ -1580,16 +1475,16 @@ async function handleApi(req, res, url) {
   }
   if (req.method === 'GET' && pathname === '/api/publish/status') {
     const remote = await git(['remote', 'get-url', 'github']);
-    const targetRemote = await publishRemote();
+    const targetRemote = await publishService.remote();
     const remoteOk = Boolean(targetRemote) && remote.code === 0 && remote.stdout.trim().toLowerCase().replace(/\.git$/, '') === targetRemote.toLowerCase().replace(/\.git$/, '');
     let commitsAhead = '0';
     try { const ahead = await git(['rev-list', '--count', 'HEAD', '--not', '--remotes=github']); commitsAhead = ahead.stdout.trim() || '0'; } catch {}
     return send(res, 200, {
       allowedRemote: targetRemote.replace(/\.git$/, ''),
-      allowedBranch: await publishBranch(),
+      allowedBranch: await publishService.branch(),
       remote: remote.code === 0 ? remote.stdout.trim() : '',
       remoteOk,
-      tokenPresent: Boolean(await findTokenFile()),
+      tokenPresent: await publishService.tokenPresent(),
       systemProxyDetected: Boolean(await systemGitProxy()),
       workflowPresent: await exists(path.join(repoRoot, '.github', 'workflows', 'hugo.yaml')),
       branch: (await git(['branch', '--show-current'])).stdout.trim(),
@@ -1599,34 +1494,23 @@ async function handleApi(req, res, url) {
     });
   }
   if (req.method === 'PUT' && pathname === '/api/publish/target') {
-    const request = JSON.parse((await readBody(req, 4096)).toString('utf8'));
-    const targetRemote = String(request.remote || '').trim();
-    const targetBranch = String(request.branch || 'main').trim();
-    if (!validBlogRemote(targetRemote)) return fail(res, 400, '请输入完整的 GitHub HTTPS 仓库地址。');
-    if (!validPublishBranch(targetBranch)) return fail(res, 400, '发布分支名无效。');
     if (publishState?.status === 'running') return fail(res, 409, '发布进行中，暂不能切换目标。');
-    const current = await git(['remote', 'get-url', 'github']);
-    const previous = current.code === 0 ? current.stdout.trim() : '';
-    const expected = await publishRemote();
-    if (previous && previous.toLowerCase().replace(/\.git$/, '') !== expected.toLowerCase().replace(/\.git$/, '')) return fail(res, 409, 'Git 远程已被其他程序修改，请先核对当前地址。');
-    const update = await git(previous ? ['remote', 'set-url', 'github', targetRemote] : ['remote', 'add', 'github', targetRemote]);
-    if (update.code !== 0) return fail(res, 500, update.stderr || '无法更新 Git 远程。');
-    try { await atomicWrite(localConfigFile, `${JSON.stringify({ ...(await readPublishConfig()), publishRemote: targetRemote, publishBranch: targetBranch }, null, 2)}\n`, { schedule: false }); }
-    catch (error) {
-      await git(previous ? ['remote', 'set-url', 'github', previous] : ['remote', 'remove', 'github']);
-      throw error;
+    try {
+      const request = JSON.parse((await readBody(req, 4096)).toString('utf8'));
+      const result = await publishService.setTarget(request.remote, request.branch);
+      return send(res, 200, { ok: true, ...result });
+    } catch (error) {
+      return fail(res, Number.isInteger(error.statusCode) ? error.statusCode : 500, error.message || '无法更新发布目标。');
     }
-    return send(res, 200, { ok: true, remote: targetRemote, branch: targetBranch });
   }
   if (req.method === 'PUT' && pathname === '/api/publish/token') {
     if (publishState?.status === 'running') return fail(res, 409, '发布进行中，暂不能修改认证令牌。');
-    const request = JSON.parse((await readBody(req, 4096)).toString('utf8'));
-    const token = validatePublishToken(request.token);
-    if (!token) return fail(res, 400, '令牌格式无效：应为只含字母、数字或下划线的 20–2048 个字符。');
-    const tokenFile = path.join(repoRoot, '.token');
-    await atomicWrite(tokenFile, `${token}\n`, { schedule: false });
-    await fs.chmod(tokenFile, 0o600).catch(() => {});
-    return send(res, 200, { ok: true, tokenPresent: true });
+    try {
+      const request = JSON.parse((await readBody(req, 4096)).toString('utf8'));
+      return send(res, 200, { ok: true, ...(await publishService.saveToken(request.token)) });
+    } catch (error) {
+      return fail(res, Number.isInteger(error.statusCode) ? error.statusCode : 500, error.message || '无法保存认证令牌。');
+    }
   }
   if (req.method === 'GET' && pathname === '/api/publish/progress') {
     const id = url.searchParams.get('id');
@@ -1647,7 +1531,7 @@ async function handleApi(req, res, url) {
       publishState.progress = Math.max(publishState.progress, Math.min(100, Number(progress) || 0));
       publishState.stage = String(stage || publishState.stage).slice(0, 160);
     };
-    void publishToBlog(commitMessage, force, report).then((result) => {
+    void publishService.publishToBlog(commitMessage, force, report).then((result) => {
       publishState.status = 'complete';
       publishState.progress = 100;
       publishState.stage = '发布完成';
