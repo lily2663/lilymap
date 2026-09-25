@@ -32,6 +32,7 @@ import { createImportRoutes } from './src/http/routes/import-routes.mjs';
 import { createSettingsRoutes } from './src/http/routes/settings-routes.mjs';
 import { createMediaRoutes } from './src/http/routes/media-routes.mjs';
 import { createNeteaseRoutes } from './src/http/routes/netease-routes.mjs';
+import { createPublishRoutes } from './src/http/routes/publish-routes.mjs';
 import { updateModulePlacement } from './src/domain/module-config.mjs';
 
 // esbuild 打包成 cjs 后 __dirname 可用；dev 模式（node 直接跑 ESM）下 __dirname 不存在，
@@ -155,23 +156,6 @@ const previewState = {
   startedAt: null,
   stoppedAt: null,
 };
-let publishState = null;
-
-function publishSnapshot() {
-  if (!publishState) return null;
-  return {
-    id: publishState.id,
-    status: publishState.status,
-    progress: publishState.progress,
-    stage: publishState.stage,
-    message: publishState.message,
-    error: publishState.error,
-    force: publishState.force,
-    startedAt: publishState.startedAt,
-    finishedAt: publishState.finishedAt,
-  };
-}
-
 function lanPreviewAddresses() {
   const virtual = /radmin|vethernet|virtual|vmware|loopback|tailscale/i;
   const candidates = [];
@@ -590,6 +574,17 @@ const mediaRoutes = createMediaRoutes({
   maxMediaBodyBytes,
 });
 const neteaseRoutes = createNeteaseRoutes({ readBody, send, fail, netease });
+const publishRoutes = createPublishRoutes({
+  repoRoot,
+  readBody,
+  send,
+  fail,
+  publishService,
+  git,
+  gitChanges,
+  systemGitProxy,
+  exists,
+});
 
 async function handleApi(req, res, url) {
   const pathname = url.pathname;
@@ -600,6 +595,7 @@ async function handleApi(req, res, url) {
   if (await settingsRoutes(req, res, url)) return;
   if (await mediaRoutes(req, res, url)) return;
   if (await neteaseRoutes(req, res, url)) return;
+  if (await publishRoutes(req, res, url)) return;
   if (req.method === 'GET' && pathname === '/api/posts') return send(res, 200, { posts: await listPosts() });
   if (req.method === 'GET' && pathname === '/api/admin/export') {
     const archive = await createLilyMapSourceArchive({ repoRoot, adminDir });
@@ -973,78 +969,6 @@ async function handleApi(req, res, url) {
       error: result.code === 0 ? undefined : 'Hugo 构建失败。',
       ...result,
     });
-  }
-  if (req.method === 'GET' && pathname === '/api/publish/status') {
-    const remote = await git(['remote', 'get-url', 'github']);
-    const targetRemote = await publishService.remote();
-    const remoteOk = Boolean(targetRemote) && remote.code === 0 && remote.stdout.trim().toLowerCase().replace(/\.git$/, '') === targetRemote.toLowerCase().replace(/\.git$/, '');
-    let commitsAhead = '0';
-    try { const ahead = await git(['rev-list', '--count', 'HEAD', '--not', '--remotes=github']); commitsAhead = ahead.stdout.trim() || '0'; } catch {}
-    return send(res, 200, {
-      allowedRemote: targetRemote.replace(/\.git$/, ''),
-      allowedBranch: await publishService.branch(),
-      remote: remote.code === 0 ? remote.stdout.trim() : '',
-      remoteOk,
-      tokenPresent: await publishService.tokenPresent(),
-      systemProxyDetected: Boolean(await systemGitProxy()),
-      workflowPresent: await exists(path.join(repoRoot, '.github', 'workflows', 'hugo.yaml')),
-      branch: (await git(['branch', '--show-current'])).stdout.trim(),
-      changes: await gitChanges(),
-      commitsAhead,
-      publishJob: publishSnapshot(),
-    });
-  }
-  if (req.method === 'PUT' && pathname === '/api/publish/target') {
-    if (publishState?.status === 'running') return fail(res, 409, '发布进行中，暂不能切换目标。');
-    try {
-      const request = JSON.parse((await readBody(req, 4096)).toString('utf8'));
-      const result = await publishService.setTarget(request.remote, request.branch);
-      return send(res, 200, { ok: true, ...result });
-    } catch (error) {
-      return fail(res, Number.isInteger(error.statusCode) ? error.statusCode : 500, error.message || '无法更新发布目标。');
-    }
-  }
-  if (req.method === 'PUT' && pathname === '/api/publish/token') {
-    if (publishState?.status === 'running') return fail(res, 409, '发布进行中，暂不能修改认证令牌。');
-    try {
-      const request = JSON.parse((await readBody(req, 4096)).toString('utf8'));
-      return send(res, 200, { ok: true, ...(await publishService.saveToken(request.token)) });
-    } catch (error) {
-      return fail(res, Number.isInteger(error.statusCode) ? error.statusCode : 500, error.message || '无法保存认证令牌。');
-    }
-  }
-  if (req.method === 'GET' && pathname === '/api/publish/progress') {
-    const id = url.searchParams.get('id');
-    if (!publishState || (id && id !== publishState.id)) return fail(res, 404, '没有找到这次发布任务。');
-    return send(res, 200, publishSnapshot());
-  }
-  if (req.method === 'POST' && pathname === '/api/publish') {
-    let request = {}; try { request = JSON.parse((await readBody(req)).toString('utf8')); } catch {}
-    const force = request.force === true;
-    const commitMessage = String(request.commit || '').trim();
-    if (publishState?.status === 'running') return fail(res, 409, '已有发布任务正在执行，请等待当前进度完成。');
-    publishState = {
-      id: randomUUID(), status: 'running', progress: 2, stage: '正在准备发布',
-      message: '', error: '', force, startedAt: new Date().toISOString(), finishedAt: null,
-    };
-    const report = (progress, stage) => {
-      if (publishState?.status !== 'running') return;
-      publishState.progress = Math.max(publishState.progress, Math.min(100, Number(progress) || 0));
-      publishState.stage = String(stage || publishState.stage).slice(0, 160);
-    };
-    void publishService.publishToBlog(commitMessage, force, report).then((result) => {
-      publishState.status = 'complete';
-      publishState.progress = 100;
-      publishState.stage = '发布完成';
-      publishState.message = result.message;
-      publishState.finishedAt = new Date().toISOString();
-    }).catch((error) => {
-      publishState.status = 'failed';
-      publishState.stage = '发布失败';
-      publishState.error = String(error?.message || '发布失败。').slice(0, 1000);
-      publishState.finishedAt = new Date().toISOString();
-    });
-    return send(res, 202, { ok: true, ...publishSnapshot() });
   }
   return fail(res, 404, '未知 API。');
 }
