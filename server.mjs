@@ -17,7 +17,7 @@ import { validateFriends, validateProfile } from './src/domain/profile.mjs';
 import { validateMenus, validateThemeSettingsPatch } from './src/domain/theme-config.mjs';
 import { createHttpPrimitives } from './src/http/primitives.mjs';
 import { updateModulePlacement } from './src/domain/module-config.mjs';
-import { isSensitivePublishPath, redactGitCredentials, validatePublishToken } from './src/domain/publish-security.mjs';
+import { isSensitivePublishPath, publishPushArguments, redactGitCredentials, validatePublishToken } from './src/domain/publish-security.mjs';
 
 // esbuild 打包成 cjs 后 __dirname 可用；dev 模式（node 直接跑 ESM）下 __dirname 不存在，
 // 用 import.meta.url 兜底推导。
@@ -727,6 +727,15 @@ function imageReferences(raw) {
 
 function importFileName(name) { return String(name || '').replaceAll('\\', '/').split('/').filter(Boolean); }
 
+async function validateImportImageFile(diskPath) {
+  const extension = path.extname(diskPath).toLowerCase();
+  if (!uploadImageExtensions.has(extension)) throw new Error(`导入图片格式不受支持：${path.basename(diskPath)}。`);
+  const stat = await fs.stat(diskPath);
+  if (!stat.isFile() || stat.size > 24 * 1024 * 1024) throw new Error(`导入图片过大或不是普通文件：${path.basename(diskPath)}。`);
+  const bytes = await fs.readFile(diskPath);
+  if (!hasExpectedImageSignature(bytes, extension)) throw new Error(`导入图片内容与扩展名不匹配或已损坏：${path.basename(diskPath)}。`);
+}
+
 function versionFor(raw, stat) { return `${stat.size}:${createHash('sha256').update(raw).digest('hex').slice(0, 16)}`; }
 
 function gitEnvironment(config = []) {
@@ -1037,7 +1046,6 @@ async function publishToBlog(commitMessage, force, report = () => {}) {
     await fs.rm(msgFile, { force: true }).catch(() => {});
     if (commit.code !== 0) throw new Error(`git commit 失败：${commit.stderr.trim()}`);
   }
-  const ref = `${force ? '+' : ''}HEAD:refs/heads/${targetBranch}`;
   const authConfig = [[`url.https://oauth2:${token}@github.com/.insteadOf`, 'https://github.com/']];
   // Keep credentials and proxy values out of the process command line. Git reads
   // one-shot config from the child environment instead, and errors are still redacted.
@@ -1051,7 +1059,13 @@ async function publishToBlog(commitMessage, force, report = () => {}) {
     newRemoteBranch = probe.code === 0 && !probe.stdout.trim();
   }
   if (fetch.code !== 0 && !newRemoteBranch) throw new Error(`git fetch 失败：${safeGitFailure(fetch, token)}`);
+  let remoteSha = '';
   if (!newRemoteBranch) {
+    const remoteHead = await git(['rev-parse', 'FETCH_HEAD']);
+    remoteSha = remoteHead.code === 0 ? remoteHead.stdout.trim() : '';
+    if (!/^[0-9a-f]{40}$/i.test(remoteSha)) throw new Error('无法确定远程分支基线，已停止发布。');
+  }
+  if (!newRemoteBranch && !force) {
     report(64, '正在检查远程差异');
     const remoteOnly = await git(['rev-list', '--count', 'FETCH_HEAD', '--not', 'HEAD']);
     if (Number(remoteOnly.stdout.trim() || '0') > 0) {
@@ -1063,8 +1077,8 @@ async function publishToBlog(commitMessage, force, report = () => {}) {
       }
     }
   }
-  report(86, force ? '正在强制推送当前源码' : '正在推送到 GitHub');
-  const push = await gitNetwork(['push', 'github', ref], authConfig);
+  report(86, force ? '正在使用远程租约安全替换当前源码' : '正在推送到 GitHub');
+  const push = await gitNetwork(publishPushArguments(targetBranch, { force, newRemoteBranch, remoteSha }), authConfig);
   if (push.code !== 0) throw new Error(`push 失败：${safeGitFailure(push, token)}`);
   report(100, '源码已推送，GitHub Actions 正在构建');
   return { message: commitMessage ? `已推送 ${commitMessage}` : `已推送到 ${targetBranch} 分支` };
@@ -1302,9 +1316,11 @@ async function prepareImport(request) {
     if (inRepo && normalized.startsWith('static/')) {
       rewrites.push({ from: reference, to: `/${normalized.slice('static/'.length)}` });
     } else if (inRepo && normalized.startsWith('assets/')) {
+      await validateImportImageFile(diskPath);
       staticCopies.push({ from: diskPath, to: normalized.replace(/^assets\//, 'static/assets/') });
       rewrites.push({ from: reference, to: `/${normalized}` });
     } else {
+      await validateImportImageFile(diskPath);
       const base = path.basename(diskPath);
       if (!diskAssets.some((asset) => asset.diskPath === diskPath)) diskAssets.push({ name: base, diskPath, parts: [base], targetParts: [base] });
       rewrites.push({ from: reference, to: base });
