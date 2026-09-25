@@ -10,6 +10,8 @@ import { resolveInside } from './src/fs/path-security.mjs';
 import { createAtomicFileService } from './src/fs/atomic-files.mjs';
 import { createLilyMapSourceArchive } from './src/services/source-archive.mjs';
 import { createBuildService } from './src/services/build-service.mjs';
+import { createImportPlanner } from './src/services/import-planner.mjs';
+import { safeSlug } from './src/domain/slug.mjs';
 import YAML from 'yaml';
 import { formatYamlValue, parseFrontMatter, patchFrontMatter } from './src/domain/front-matter.mjs';
 import { parseToml, patchMenus, patchTomlValue } from './src/domain/toml.mjs';
@@ -126,6 +128,7 @@ const { adminHostAllowed, adminOriginAllowed, fail, hasExpectedImageSignature, h
 // lilymap 管理的图片一律限制为栅格格式。SVG 是可执行文档，和管理 API
 // 同源时会扩大本地 XSS 攻击面；已有的主题 SVG 仍可由静态站点正常使用。
 const uploadImageExtensions = new Set(['.png', '.jpg', '.jpeg', '.webp', '.gif', '.avif']);
+const prepareImport = createImportPlanner({ repoRoot, uploadImageExtensions, hasExpectedImageSignature, httpError });
 const uploadVideoExtensions = new Set(['.mp4', '.webm', '.mov', '.m4v', '.mkv', '.avi']);
 const browserVideoExtensions = new Set(['.mp4', '.webm']);
 const mediaTargetNames = new Map([
@@ -644,21 +647,6 @@ async function uninstallSiteModule(id) {
   return { id, trashedTo: relativeToRepo(destinationRoot) };
 }
 
-function imageReferences(raw) {
-  return [...raw.matchAll(/!\[[^\]]*\]\(([^)\s]+)(?:\s+[^)]*)?\)/g)].map((match) => match[1]).filter((reference) => !/^https?:|^\//i.test(reference));
-}
-
-function importFileName(name) { return String(name || '').replaceAll('\\', '/').split('/').filter(Boolean); }
-
-async function validateImportImageFile(diskPath) {
-  const extension = path.extname(diskPath).toLowerCase();
-  if (!uploadImageExtensions.has(extension)) throw new Error(`导入图片格式不受支持：${path.basename(diskPath)}。`);
-  const stat = await fs.stat(diskPath);
-  if (!stat.isFile() || stat.size > 24 * 1024 * 1024) throw new Error(`导入图片过大或不是普通文件：${path.basename(diskPath)}。`);
-  const bytes = await fs.readFile(diskPath);
-  if (!hasExpectedImageSignature(bytes, extension)) throw new Error(`导入图片内容与扩展名不匹配或已损坏：${path.basename(diskPath)}。`);
-}
-
 function versionFor(raw, stat) { return `${stat.size}:${createHash('sha256').update(raw).digest('hex').slice(0, 16)}`; }
 
 function gitEnvironment(config = []) {
@@ -1107,110 +1095,6 @@ const { atomicWrite, atomicCreate, copyWithoutClobber } = createAtomicFileServic
   httpError,
   relativeToRepo,
 });
-
-async function prepareImport(request) {
-  const files = Array.isArray(request.files) ? request.files : [];
-  const markdown = files.filter((file) => /\.md(?:own)?$/i.test(file.name || '') || /\.markdown$/i.test(file.name || ''));
-  if (markdown.length !== 1) throw new Error('一次导入请选择一个 Markdown 文件（可同时包含它的图片目录）。');
-  const source = markdown[0];
-  const raw = Buffer.from(String(source.content || ''), 'base64').toString('utf8').replace(/^\uFEFF/, '');
-  const parsed = parseFrontMatter(raw);
-  const fileStem = path.basename(source.name, path.extname(source.name));
-  const title = parsed.frontMatter.title || request.title || fileStem;
-  const inferredSlug = String(title || fileStem).trim().toLowerCase().replace(/\s+/g, '-');
-  const slug = safeSlug(parsed.frontMatter.slug || request.slug || inferredSlug || fileStem);
-  if (!slug) throw new Error('无法生成安全的 Slug。');
-  const sourceParts = importFileName(source.relativePath || source.name);
-  const sourceDirectory = sourceParts.slice(0, -1).join('/');
-  const body = parsed.body;
-  const references = imageReferences(body);
-  // Typora often embeds absolute Windows paths for images. Resolve them
-  // against the repo: files under static/ keep their public URL, files under
-  // root assets/ are copied into static/assets/ for deployment, other local
-  // files become bundle images, and missing ones fall back to a bundle
-  // basename so the pick-missing flow can still match them.
-  const absolutePattern = /^(?:[A-Za-z]:[\\/]|\\\\)/;
-  const rewrites = [];
-  const staticCopies = [];
-  const diskAssets = [];
-  for (const reference of [...new Set(references)]) {
-    if (!absolutePattern.test(reference)) continue;
-    let diskPath = null;
-    try {
-      const candidate = path.resolve(reference);
-      if ((await fs.stat(candidate)).isFile()) diskPath = candidate;
-    } catch {}
-    if (!diskPath) { rewrites.push({ from: reference, to: path.basename(reference.replaceAll('\\', '/')) }); continue; }
-    const relativeToRoot = path.relative(repoRoot, diskPath);
-    const inRepo = relativeToRoot && !relativeToRoot.startsWith('..') && !path.isAbsolute(relativeToRoot);
-    const normalized = inRepo ? relativeToRoot.replaceAll('\\', '/') : '';
-    if (inRepo && normalized.startsWith('static/')) {
-      rewrites.push({ from: reference, to: `/${normalized.slice('static/'.length)}` });
-    } else if (inRepo && normalized.startsWith('assets/')) {
-      await validateImportImageFile(diskPath);
-      staticCopies.push({ from: diskPath, to: normalized.replace(/^assets\//, 'static/assets/') });
-      rewrites.push({ from: reference, to: `/${normalized}` });
-    } else {
-      await validateImportImageFile(diskPath);
-      const base = path.basename(diskPath);
-      if (!diskAssets.some((asset) => asset.diskPath === diskPath)) diskAssets.push({ name: base, diskPath, parts: [base], targetParts: [base] });
-      rewrites.push({ from: reference, to: base });
-    }
-  }
-  rewrites.sort((a, b) => b.from.length - a.from.length);
-  let rewritten = raw;
-  for (const rewrite of rewrites) rewritten = rewritten.split(rewrite.from).join(rewrite.to);
-  const referencesClean = references.map((reference) => reference.replace(/^\.\//, ''));
-  const bundleRefs = [];
-  for (const reference of referencesClean) {
-    const rewrite = rewrites.find((item) => item.from === reference);
-    const effective = rewrite ? rewrite.to : reference;
-    if (!/^(?:https?:)?\/\//i.test(effective) && !effective.startsWith('/')) bundleRefs.push(effective);
-  }
-  const referenceByBase = new Map();
-  for (const reference of bundleRefs) {
-    const base = reference.split('/').pop();
-    if (base && !referenceByBase.has(base)) referenceByBase.set(base, reference);
-  }
-  const selected = files.filter((file) => file !== source).map((file) => {
-    const parts = importFileName(file.relativePath || file.name);
-    const relativeParts = sourceDirectory && parts.slice(0, sourceParts.length - 1).join('/') === sourceDirectory ? parts.slice(sourceParts.length - 1) : parts;
-    let targetParts = relativeParts;
-    const joined = relativeParts.join('/');
-    if (!bundleRefs.includes(joined) && relativeParts.length === 1 && referenceByBase.has(relativeParts[0])) targetParts = referenceByBase.get(relativeParts[0]).split('/');
-    return { ...file, parts, targetParts };
-  });
-  const selectedNames = new Set();
-  for (const file of selected) { selectedNames.add(file.parts.join('/')); selectedNames.add(file.parts.at(-1)); selectedNames.add(file.targetParts.join('/')); }
-  for (const asset of diskAssets) selectedNames.add(asset.targetParts.join('/'));
-  const missing = bundleRefs.filter((reference) => !selectedNames.has(reference) && !selectedNames.has(reference.split('/').pop()));
-  // Windows 文件系统大小写不敏感；在导入确认阶段就拦截两个输入归到同一
-  // 个目标路径的情况，避免后写入的图片覆盖先写入的图片。
-  const uniqueAssets = [];
-  const assetTargets = new Map();
-  for (const asset of [...selected, ...diskAssets]) {
-    const targetParts = Array.isArray(asset.targetParts) ? asset.targetParts : [];
-    const targetKey = targetParts.join('/').replaceAll('\\', '/').toLowerCase();
-    if (!targetKey || targetKey === 'index.md') continue;
-    const previous = assetTargets.get(targetKey);
-    if (previous) {
-      const sameDiskFile = previous.diskPath && asset.diskPath && path.resolve(previous.diskPath) === path.resolve(asset.diskPath);
-      if (sameDiskFile) continue;
-      throw httpError(409, `导入资源同名冲突：${targetParts.join('/')}。请重命名后再导入。`);
-    }
-    assetTargets.set(targetKey, asset);
-    uniqueAssets.push(asset);
-  }
-  const changes = [];
-  const content = parsed.rawFrontMatter ? rewritten : `---\ntitle: ${formatYamlValue(title)}\ndate: ${new Date().toISOString()}\nlastmod: ${new Date().toISOString()}\nslug: ${formatYamlValue(slug)}\nsummary: ""\ntags: []\ncategories: []\ndraft: ${request.draft === false ? 'false' : 'true'}\n---\n\n${rewritten}`;
-  return { slug, title, raw: content, hasFrontMatter: Boolean(parsed.rawFrontMatter), sourceDirectory, assets: uniqueAssets, references, missing, rewrites, staticCopies, changes };
-}
-
-function safeSlug(input) {
-  const slug = String(input || '').trim().replace(/\s+/g, '-');
-  if (!slug || slug.length > 100 || /[\\/:*?"<>|]/.test(slug) || slug === '.' || slug === '..' || slug.includes('..')) return null;
-  return slug;
-}
 
 async function handleApi(req, res, url) {
   const pathname = url.pathname;
