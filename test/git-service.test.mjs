@@ -71,3 +71,26 @@ test('environment proxy is reused for Git network calls without shell interpolat
   assert.equal(calls[0].options.env.GIT_CONFIG_KEY_0, 'http.proxy');
   assert.equal(calls[0].options.env.GIT_CONFIG_VALUE_0, 'http://127.0.0.1:12000/');
 });
+
+
+test('git service delegates commands to the shared process runner with a timeout', async () => {
+  const calls = [];
+  const service = createGitService({
+    repoRoot: '/tmp/blog',
+    platform: 'linux',
+    environment: {},
+    timeoutMs: 4321,
+    processRunner: {
+      run: async (command, args, options) => {
+        calls.push({ command, args, options });
+        return { code: 0, stdout: '', stderr: '', output: '', timedOut: false, aborted: false };
+      },
+    },
+  });
+
+  await service.git(['status', '--short']);
+  assert.equal(calls[0].command, 'git');
+  assert.equal(calls[0].options.cwd, '/tmp/blog');
+  assert.equal(calls[0].options.timeoutMs, 4321);
+  assert.equal(calls[0].options.env.GIT_TERMINAL_PROMPT, '0');
+});
