@@ -16,7 +16,7 @@ import { normalizeLayout, normalizeModuleManifest, parseLayout, serializeLayout,
 import { validateFriends, validateProfile } from './src/domain/profile.mjs';
 import { createHttpPrimitives } from './src/http/primitives.mjs';
 import { updateModulePlacement } from './src/domain/module-config.mjs';
-import { redactGitCredentials, validatePublishToken } from './src/domain/publish-security.mjs';
+import { isSensitivePublishPath, redactGitCredentials, validatePublishToken } from './src/domain/publish-security.mjs';
 
 // esbuild 打包成 cjs 后 __dirname 可用；dev 模式（node 直接跑 ESM）下 __dirname 不存在，
 // 用 import.meta.url 兜底推导。
@@ -991,8 +991,19 @@ async function publishToBlog(commitMessage, force, report = () => {}) {
   await ensureBlogRemote(await publishRemote());
   const targetBranch = await publishBranch();
   report(20, '正在整理本地变更');
-  const add = await git(['add', '-A']);
+  const trackedLocal = await git(['ls-files', '--', '.token', '.lilymap-local.json', 'lilymap.json', 'hugo-desk.json', '.secrets', 'private-content', '.admin-trash', '.backups']);
+  if (trackedLocal.code !== 0) throw new Error(`无法检查本机敏感文件：${trackedLocal.stderr.trim()}`);
+  const trackedSensitive = trackedLocal.stdout.split(/\r?\n/).filter(Boolean).filter(isSensitivePublishPath);
+  if (trackedSensitive.length) throw new Error(`检测到不应进入 Git 的本机文件：${trackedSensitive.slice(0, 5).join(', ')}。请先从 Git 索引移除后再发布。`);
+  const add = await git(['add', '-A', '--', '.',
+    ':(exclude).token', ':(exclude).lilymap-local.json', ':(exclude)lilymap.json', ':(exclude)hugo-desk.json',
+    ':(exclude).secrets/**', ':(exclude)private-content/**', ':(exclude).admin-trash/**', ':(exclude).backups/**',
+  ]);
   if (add.code !== 0) throw new Error(`git add 失败：${add.stderr.trim()}`);
+  const stagedNames = await git(['diff', '--cached', '--name-only', '--']);
+  if (stagedNames.code !== 0) throw new Error(`无法检查暂存区：${stagedNames.stderr.trim()}`);
+  const stagedSensitive = stagedNames.stdout.split(/\r?\n/).filter(Boolean).filter(isSensitivePublishPath);
+  if (stagedSensitive.length) throw new Error(`暂存区包含本机敏感文件，已拒绝发布：${stagedSensitive.slice(0, 5).join(', ')}。`);
   const staged = await git(['diff', '--cached', '--quiet']);
   report(30, staged.code !== 0 ? '正在创建本次提交' : '没有新文件需要提交');
   if (staged.code !== 0) {
