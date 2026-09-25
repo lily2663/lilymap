@@ -180,10 +180,25 @@ export function createPublishService({
 
     report(86, force ? '正在使用远程租约安全替换当前源码' : '正在推送到 GitHub');
     const push = await gitNetwork(publishPushArguments(targetBranch, { force, newRemoteBranch, remoteSha }), authConfig);
-    if (push.code !== 0) throw new Error(`push 失败：${safeGitFailure(push, token)}`);
+    let reconciledAfterAmbiguousFailure = false;
+    if (push.code !== 0) {
+      report(93, '推送结果不明确，正在核对 GitHub 远端状态');
+      const localHead = await git(['rev-parse', 'HEAD']);
+      const localSha = localHead.code === 0 ? localHead.stdout.trim() : '';
+      const probe = await gitNetwork(['ls-remote', 'github', `refs/heads/${targetBranch}`], authConfig);
+      const publishedSha = probe.code === 0 ? probe.stdout.trim().split(/\s+/)[0] || '' : '';
+      if (/^[0-9a-f]{40}$/i.test(localSha) && publishedSha.toLowerCase() === localSha.toLowerCase()) {
+        reconciledAfterAmbiguousFailure = true;
+      } else {
+        throw new Error(`push 失败：${safeGitFailure(push, token)}`);
+      }
+    }
 
-    report(100, '源码已推送，GitHub Actions 正在构建');
-    return { message: commitMessage ? `已推送 ${commitMessage}` : `已推送到 ${targetBranch} 分支` };
+    report(100, reconciledAfterAmbiguousFailure ? '已确认源码实际推送成功，GitHub Actions 正在构建' : '源码已推送，GitHub Actions 正在构建');
+    return {
+      message: commitMessage ? `已推送 ${commitMessage}` : `已推送到 ${targetBranch} 分支`,
+      reconciledAfterAmbiguousFailure,
+    };
   }
 
   return { remote, branch, tokenPresent, saveToken, setTarget, publishToBlog };
