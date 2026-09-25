@@ -64,3 +64,68 @@ test('network adapter parses bounded JSON and exposes manual redirects', async (
   assert.equal(redirected.status, 302);
   assert.equal(redirected.location, 'https://evil.example/');
 });
+
+
+test('safe metadata redirects revalidate every target and strip secrets across hosts', async () => {
+  const calls = [];
+  const adapter = createNetworkAdapter({
+    fetchImpl: async (url, options) => {
+      calls.push({ url: String(url), headers: { ...options.headers } });
+      if (String(url).includes('music.163.com')) {
+        return {
+          status: 302,
+          ok: false,
+          url: String(url),
+          headers: headers({ location: 'https://m801.music.126.net/file.mp3' }),
+          body: null,
+          redirected: false,
+        };
+      }
+      return {
+        status: 200,
+        ok: true,
+        url: String(url),
+        headers: headers({ 'content-type': 'audio/mpeg' }),
+        body: null,
+        redirected: false,
+      };
+    },
+  });
+
+  const result = await adapter.requestMetadataFollowing('https://music.163.com/song', {
+    allowedHosts: ['music.163.com'],
+    allowHostname: (host) => /^[a-z0-9.-]+\.music\.126\.net$/.test(host),
+    headers: { cookie: 'secret=1', accept: '*/*' },
+  });
+  assert.equal(result.status, 200);
+  assert.equal(calls.length, 2);
+  assert.equal(calls[0].headers.cookie, 'secret=1');
+  assert.equal(calls[1].headers.cookie, undefined);
+  assert.equal(calls[1].headers.accept, '*/*');
+});
+
+test('safe metadata redirects refuse an unapproved target before making the second request', async () => {
+  let calls = 0;
+  const adapter = createNetworkAdapter({
+    fetchImpl: async (url) => {
+      calls += 1;
+      return {
+        status: 302,
+        ok: false,
+        url: String(url),
+        headers: headers({ location: 'https://127.0.0.1/private' }),
+        body: null,
+        redirected: false,
+      };
+    },
+  });
+
+  await assert.rejects(
+    () => adapter.requestMetadataFollowing('https://music.163.com/song', {
+      allowedHosts: ['music.163.com'],
+      allowHostname: (host) => host.endsWith('.music.126.net'),
+    }),
+    (error) => error.code === 'HOST_NOT_ALLOWED',
+  );
+  assert.equal(calls, 1);
+});
