@@ -23,11 +23,9 @@ import { createLayoutModuleService } from './src/services/layout-module-service.
 import { createResourceService } from './src/services/resource-service.mjs';
 import { safeSlug } from './src/domain/slug.mjs';
 import YAML from 'yaml';
-import { formatYamlValue, parseFrontMatter, patchFrontMatter } from './src/domain/front-matter.mjs';
-import { parseToml } from './src/domain/toml.mjs';
+import { parseFrontMatter, patchFrontMatter } from './src/domain/front-matter.mjs';
 import { decryptProtectedBody, encryptProtectedBody } from './src/domain/protected-content.mjs';
 import { isObject, parseYaml } from './src/domain/value.mjs';
-import { normalizeLayout, normalizeModuleManifest, parseLayout, serializeLayout, validateLayoutAgainstRegistry } from './src/domain/layout.mjs';
 import { createHttpPrimitives } from './src/http/primitives.mjs';
 import { streamFile } from './src/http/static-files.mjs';
 import { createImportRoutes } from './src/http/routes/import-routes.mjs';
@@ -37,7 +35,6 @@ import { createNeteaseRoutes } from './src/http/routes/netease-routes.mjs';
 import { createPublishRoutes } from './src/http/routes/publish-routes.mjs';
 import { createLayoutModuleRoutes } from './src/http/routes/layout-module-routes.mjs';
 import { createResourceRoutes } from './src/http/routes/resource-routes.mjs';
-import { updateModulePlacement } from './src/domain/module-config.mjs';
 
 // esbuild 打包成 cjs 后 __dirname 可用；dev 模式（node 直接跑 ESM）下 __dirname 不存在，
 // 用 import.meta.url 兜底推导。
