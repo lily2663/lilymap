@@ -2,6 +2,7 @@ import { api } from '../core/api.js';
 import { $, esc, toast } from '../core/dom.js';
 import { state } from '../core/state.js';
 import { icon } from '../core/icons.js';
+import { selectOptionIndex, selectOptionLabel, selectOptionValue } from '../core/value.js';
 import { renderMusicModule } from './music-module.js';
 import { renderModuleInstaller } from './module-installer.js';
 
@@ -148,8 +149,12 @@ export async function renderModules({ page, bindCommon, navigate }) {
       form.addEventListener('input', changed); form.addEventListener('change', changed);
       $('#module-defaults').onclick = () => {
         form.querySelectorAll('[data-module-field]').forEach((input) => {
-          const value = module.defaults[input.dataset.moduleField];
-          if (input.type === 'checkbox') input.checked = Boolean(value); else input.value = value ?? '';
+          const key = input.dataset.moduleField;
+          const value = module.defaults[key];
+          const definition = module.schema[key];
+          if (input.type === 'checkbox') input.checked = Boolean(value);
+          else if (definition?.type === 'select') input.value = String(selectOptionIndex(definition, value));
+          else input.value = value ?? '';
         });
         changed();
       };
@@ -161,7 +166,14 @@ export async function renderModules({ page, bindCommon, navigate }) {
         const config = {};
         form.querySelectorAll('[data-module-field]').forEach((input) => {
           const key = input.dataset.moduleField;
-          config[key] = module.schema[key].type === 'boolean' ? input.checked : module.schema[key].type === 'number' ? Number(input.value) : input.value;
+          const definition = module.schema[key];
+          config[key] = definition.type === 'boolean'
+            ? input.checked
+            : definition.type === 'number'
+              ? Number(input.value)
+              : definition.type === 'select'
+                ? selectOptionValue(definition, input.value)
+                : input.value;
         });
         const enabled = $('#module-enabled').checked;
         saving = true;
@@ -191,7 +203,10 @@ function field(key, value, definition) {
   const help = definition.help ? `<small>${esc(definition.help)}</small>` : '';
   const attr = `data-module-field="${esc(key)}"`;
   if (definition.type === 'boolean') return `<label class="switch"><span><b>${label}</b>${help}</span><input ${attr} type="checkbox" ${value ? 'checked' : ''}></label>`;
-  if (definition.type === 'select') return `<label class="field"><span>${label}</span><select ${attr}>${(definition.options || []).map((option) => `<option value="${esc(option.value)}" ${option.value === value ? 'selected' : ''}>${esc(option.label || option.value)}</option>`).join('')}</select>${help}</label>`;
+  if (definition.type === 'select') {
+    const selected = selectOptionIndex(definition, value);
+    return `<label class="field"><span>${label}</span><select ${attr}>${(definition.options || []).map((option, optionIndex) => `<option value="${optionIndex}" ${optionIndex === selected ? 'selected' : ''}>${esc(selectOptionLabel(option))}</option>`).join('')}</select>${help}</label>`;
+  }
   if (['text','description','subtitle','hint','pinned'].includes(key) || definition.type === 'textarea') return `<label class="field"><span>${label}</span><textarea ${attr} rows="3">${esc(value ?? '')}</textarea>${help}</label>`;
   const type = definition.type === 'number' ? 'number' : definition.type === 'color' ? 'color' : 'text';
   const limits = type === 'number' ? `required step="${esc(definition.step ?? 'any')}" ${Number.isFinite(definition.min) ? `min="${definition.min}"` : ''} ${Number.isFinite(definition.max) ? `max="${definition.max}"` : ''}` : '';

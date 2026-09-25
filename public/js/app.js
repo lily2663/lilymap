@@ -3,6 +3,7 @@ import { $, esc, toast } from './core/dom.js';
 import { allowedViews, state } from './core/state.js';
 import { decorateNavigation } from './core/icons.js';
 import { studioOverview } from './core/studio.js';
+import { selectOptionIndex, selectOptionLabel, selectOptionValue } from './core/value.js';
 import { renderModules, leaveModuleEditor } from './features/module-library.js';
 
 decorateNavigation();
@@ -902,13 +903,16 @@ async function layouts() {
           (l) => l.name === state.lbrd.name,
         ).parsed;
         let module = state.lbrd.data.modules[P.slots[slot][+idx].module];
-        let type = module?.schema?.[key]?.type || "string";
+        const definition = module?.schema?.[key] || { type: "string" };
+        const type = definition.type || "string";
         P.slots[slot][+idx].config[key] =
           type === "boolean"
             ? e.target.checked
             : type === "number"
               ? Number(e.target.value)
-              : e.target.value;
+              : type === "select"
+                ? selectOptionValue(definition, e.target.value)
+                : e.target.value;
       }),
   );
   document.querySelectorAll("[data-lbrd-select]").forEach((block) => block.onclick = (event) => {
@@ -939,8 +943,10 @@ async function layouts() {
     let data = `data-lbrd-field="${slot}::${index}::${key}"`;
     if (type === "boolean")
       return `<label class="switch"><span><b>${esc(label)}</b>${help}</span><input ${data} type="checkbox" ${value ? "checked" : ""}></label>`;
-    if (type === "select")
-      return `<label class="field"><span>${esc(label)}</span><select ${data}>${(definition.options || []).map((option) => `<option value="${esc(option.value)}" ${option.value === value ? "selected" : ""}>${esc(option.label || option.value)}</option>`).join("")}</select>${help}</label>`;
+    if (type === "select") {
+      const selected = selectOptionIndex(definition, value);
+      return `<label class="field"><span>${esc(label)}</span><select ${data}>${(definition.options || []).map((option, optionIndex) => `<option value="${optionIndex}" ${optionIndex === selected ? "selected" : ""}>${esc(selectOptionLabel(option))}</option>`).join("")}</select>${help}</label>`;
+    }
     let inputType = type === "number" ? "number" : type === "color" ? "color" : type === "url" ? "url" : "text";
     return `<label class="field"><span>${esc(label)}</span><input ${data} type="${inputType}" value="${esc(value ?? "")}">${help}</label>`;
   }
