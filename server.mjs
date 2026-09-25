@@ -115,7 +115,7 @@ const maxBodyBytes = 8 * 1024 * 1024;
 const maxMediaBodyBytes = 160 * 1024 * 1024;
 const maxDecodedImageBytes = 64 * 1024 * 1024;
 const maxBuildOutputBytes = 16 * 1024;
-const { adminOriginAllowed, fail, hasExpectedImageSignature, httpError, readBody, send, staticSecurityHeaders } = createHttpPrimitives({
+const { adminHostAllowed, adminOriginAllowed, fail, hasExpectedImageSignature, httpError, readBody, send, staticSecurityHeaders } = createHttpPrimitives({
   port,
   maxBodyBytes,
   maxDecodedImageBytes,
@@ -709,13 +709,28 @@ function importFileName(name) { return String(name || '').replaceAll('\\', '/').
 
 function versionFor(raw, stat) { return `${stat.size}:${createHash('sha256').update(raw).digest('hex').slice(0, 16)}`; }
 
-async function git(args) {
+function gitEnvironment(config = []) {
+  const env = { ...process.env, GIT_TERMINAL_PROMPT: '0' };
+  for (const key of Object.keys(env)) {
+    if (key === 'GIT_CONFIG_COUNT' || /^GIT_CONFIG_(?:KEY|VALUE)_\d+$/.test(key)) delete env[key];
+  }
+  if (config.length) {
+    env.GIT_CONFIG_COUNT = String(config.length);
+    config.forEach(([key, value], index) => {
+      env[`GIT_CONFIG_KEY_${index}`] = String(key);
+      env[`GIT_CONFIG_VALUE_${index}`] = String(value);
+    });
+  }
+  return env;
+}
+
+async function git(args, config = []) {
   return new Promise((resolve) => {
     const child = spawn('git', args, {
       cwd: repoRoot,
       windowsHide: true,
       shell: false,
-      env: { ...process.env, GIT_TERMINAL_PROMPT: '0' },
+      env: gitEnvironment(config),
     });
     let stdout = ''; let stderr = '';
     child.stdout.on('data', (data) => { stdout += data; });
@@ -898,12 +913,12 @@ function isTransientGitNetworkFailure(result) {
   return /failed to connect|could not resolve|connection (?:was )?reset|timed? out|tls connect|http\/2 stream|schannel/i.test(`${result.stderr}\n${result.stdout}`);
 }
 
-async function gitNetwork(args) {
+async function gitNetwork(args, config = []) {
   const proxy = await systemGitProxy();
-  const transport = proxy ? ['-c', `http.proxy=${proxy}`] : [];
-  let result = await git([...transport, ...args]);
+  const transport = proxy ? [['http.proxy', proxy]] : [];
+  let result = await git(args, [...transport, ...config]);
   if (result.code !== 0 && isTransientGitNetworkFailure(result)) {
-    result = await git(['-c', 'http.version=HTTP/1.1', ...transport, ...args]);
+    result = await git(args, [['http.version', 'HTTP/1.1'], ...transport, ...config]);
     result.retried = true;
   }
   result.proxyDetected = Boolean(proxy);
@@ -992,14 +1007,16 @@ async function publishToBlog(commitMessage, force, report = () => {}) {
     if (commit.code !== 0) throw new Error(`git commit 失败：${commit.stderr.trim()}`);
   }
   const ref = `${force ? '+' : ''}HEAD:refs/heads/${targetBranch}`;
-  const rewrite = `url.https://oauth2:${token}@github.com/.insteadOf=https://github.com/`;
+  const authConfig = [[`url.https://oauth2:${token}@github.com/.insteadOf`, 'https://github.com/']];
+  // Keep credentials and proxy values out of the process command line. Git reads
+  // one-shot config from the child environment instead, and errors are still redacted.
   // Reconcile remote-first changes (e.g. edits made directly on GitHub web)
   // so a stale local branch never blocks publishing with a non-fast-forward.
   report(46, '正在获取 GitHub 上的最新版本');
-  const fetch = await gitNetwork(['-c', rewrite, 'fetch', 'github', targetBranch]);
+  const fetch = await gitNetwork(['fetch', 'github', targetBranch], authConfig);
   let newRemoteBranch = false;
   if (fetch.code !== 0 && force) {
-    const probe = await gitNetwork(['-c', rewrite, 'ls-remote', 'github', `refs/heads/${targetBranch}`]);
+    const probe = await gitNetwork(['ls-remote', 'github', `refs/heads/${targetBranch}`], authConfig);
     newRemoteBranch = probe.code === 0 && !probe.stdout.trim();
   }
   if (fetch.code !== 0 && !newRemoteBranch) throw new Error(`git fetch 失败：${safeGitFailure(fetch, token)}`);
@@ -1016,7 +1033,7 @@ async function publishToBlog(commitMessage, force, report = () => {}) {
     }
   }
   report(86, force ? '正在强制推送当前源码' : '正在推送到 GitHub');
-  const push = await gitNetwork(['-c', rewrite, 'push', 'github', ref]);
+  const push = await gitNetwork(['push', 'github', ref], authConfig);
   if (push.code !== 0) throw new Error(`push 失败：${safeGitFailure(push, token)}`);
   report(100, '源码已推送，GitHub Actions 正在构建');
   return { message: commitMessage ? `已推送 ${commitMessage}` : `已推送到 ${targetBranch} 分支` };
@@ -1997,6 +2014,7 @@ async function streamFile(req, res, target, headers = {}) {
 const publicCandidates = [publicRoot, path.join(repoRoot, 'tools', 'admin', 'public')].filter(Boolean);
 const server = createServer(async (req, res) => {
   try {
+    if (!adminHostAllowed(req)) return fail(res, 403, '管理端只接受 localhost 或 127.0.0.1 请求。');
     const url = new URL(req.url, 'http://127.0.0.1');
     if (url.pathname.startsWith('/api/')) return await handleApi(req, res, url);
     const requested = url.pathname === '/' ? 'index.html' : url.pathname.slice(1);
