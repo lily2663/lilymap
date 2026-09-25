@@ -21,6 +21,7 @@ import { normalizeLayout, normalizeModuleManifest, parseLayout, serializeLayout,
 import { validateFriends, validateProfile } from './src/domain/profile.mjs';
 import { validateMenus, validateThemeSettingsPatch } from './src/domain/theme-config.mjs';
 import { createHttpPrimitives } from './src/http/primitives.mjs';
+import { streamFile } from './src/http/static-files.mjs';
 import { updateModulePlacement } from './src/domain/module-config.mjs';
 import { isSensitivePublishPath, publishPushArguments, redactGitCredentials, validatePublishToken } from './src/domain/publish-security.mjs';
 
@@ -1752,49 +1753,6 @@ async function handleApi(req, res, url) {
   return fail(res, 404, '未知 API。');
 }
 
-const mime = {
-  '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.css': 'text/css; charset=utf-8',
-  '.json': 'application/json; charset=utf-8', '.xml': 'application/xml; charset=utf-8', '.txt': 'text/plain; charset=utf-8',
-  '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.webp': 'image/webp', '.gif': 'image/gif',
-  '.svg': 'image/svg+xml', '.avif': 'image/avif', '.ico': 'image/x-icon',
-  '.woff': 'font/woff', '.woff2': 'font/woff2', '.ttf': 'font/ttf',
-  '.mp3': 'audio/mpeg', '.mp4': 'video/mp4', '.webm': 'video/webm', '.pdf': 'application/pdf',
-};
-
-async function streamFile(req, res, target, headers = {}) {
-  const stat = await fs.stat(target);
-  const common = {
-    'content-type': mime[path.extname(target)] || 'application/octet-stream',
-    'content-length': stat.size,
-    'accept-ranges': 'bytes',
-    ...headers,
-  };
-  const match = String(req.headers.range || '').match(/^bytes=(\d*)-(\d*)$/);
-  if (match) {
-    let start = match[1] ? Number(match[1]) : NaN;
-    let end = match[2] ? Number(match[2]) : NaN;
-    if (!Number.isFinite(start) && Number.isFinite(end)) {
-      start = Math.max(0, stat.size - end);
-      end = stat.size - 1;
-    } else {
-      if (!Number.isFinite(start)) start = 0;
-      if (!Number.isFinite(end)) end = stat.size - 1;
-    }
-    if (start < 0 || end < start || start >= stat.size) {
-      res.writeHead(416, { ...common, 'content-range': `bytes */${stat.size}`, 'content-length': 0 });
-      res.end();
-      return;
-    }
-    end = Math.min(end, stat.size - 1);
-    res.writeHead(206, { ...common, 'content-range': `bytes ${start}-${end}/${stat.size}`, 'content-length': end - start + 1 });
-    if (req.method === 'HEAD') return res.end();
-    fsSync.createReadStream(target, { start, end }).pipe(res);
-    return;
-  }
-  res.writeHead(200, common);
-  if (req.method === 'HEAD') return res.end();
-  fsSync.createReadStream(target).pipe(res);
-}
 // 打包后 public 位于 exe 快照；源码模式从 tools/admin/public 读取。最后一个候选
 // 兼容旧版便携包，便于仍与源码项目放在一起的用户完成升级。
 const publicCandidates = [publicRoot, path.join(repoRoot, 'tools', 'admin', 'public')].filter(Boolean);
