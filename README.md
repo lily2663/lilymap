@@ -73,7 +73,7 @@ Markdown 正文不会被导入流程格式化，也不会转换为私有格式�
 
 ## 本地安全边界
 
-- API 仅监听本机，所有路径经仓库白名单校验。
+- API 仅监听本机，并拒绝非 `localhost` / `127.0.0.1` Host；写请求还校验 Origin / Fetch Metadata，降低 DNS rebinding 与跨站请求风险。所有路径经仓库白名单校验。
 - 新建和导入使用 `content/posts/<slug>/index.md` Page Bundle。
 - 写入使用临时文件再 rename 的原子方式。
 - 删除文章移入 `.admin-trash/`，该目录不进入 Git。
