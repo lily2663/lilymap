@@ -244,10 +244,10 @@ async function blogStatus() {
   return { ...previewSnapshot(), running, ready };
 }
 
-async function protectionFeatureEnabled() {
+async function protectionManagementEnabled() {
   try {
     const raw = await fs.readFile(path.join(repoRoot, 'hugo.toml'), 'utf8');
-    return parseToml(raw).values['params.protected.enabled'] !== false;
+    return parseToml(raw).values['params.protected.managementEnabled'] !== false;
   } catch {
     // 配置读取失败时沿用旧版本行为，避免因临时配置错误误锁住恢复入口。
     return true;
@@ -502,7 +502,7 @@ async function handleApi(req, res, url) {
       branch: branch.stdout.trim(), changes, postCount, blogUrl: blog.url, blogLanUrl: blog.lanUrl,
       blogRunning: blog.running, blogStatus: blog.status, preview: blog, build: buildSnapshot(),
       head: head.stdout.trim().split('\0'),
-      protectionFeatureEnabled: await protectionFeatureEnabled(),
+      protectionManagementEnabled: await protectionManagementEnabled(),
     });
   }
   if (req.method === 'GET' && pathname === '/api/posts') return send(res, 200, { posts: await listPosts() });
@@ -552,7 +552,7 @@ async function handleApi(req, res, url) {
     return send(res, 200, { ok: true, version: versionFor(saved, savedStat), article: await articleRecord(target, await gitChanges()) });
   }
   if (req.method === 'POST' && pathname === '/api/protected') {
-    if (!(await protectionFeatureEnabled())) return fail(res, 503, '文章加密功能正在维护中，暂不接受加密或解除保护操作。');
+    if (!(await protectionManagementEnabled())) return fail(res, 503, '文章加密管理功能正在维护中，暂不接受加密或解除保护操作。');
     const request = JSON.parse((await readBody(req, 16 * 1024)).toString('utf8'));
     const target = repoPath(request.path, [path.join(contentRoot, 'posts')]);
     if (!target || path.basename(target).toLowerCase() !== 'index.md' || !(await exists(target))) return fail(res, 404, '文章不存在。');

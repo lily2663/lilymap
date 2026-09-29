@@ -302,7 +302,7 @@ async function openArticle(path) {
     );
     let b = $("#drawer-body");
     if (tab === "meta") {
-      const protectionEnabled = state.status?.protectionFeatureEnabled !== false;
+      const protectionEnabled = state.status?.protectionManagementEnabled !== false;
       const protectionControls = protectionEnabled
         ? `<p class="muted">${p.protected ? "已加密；解除保护将使正文公开。" : "可设置密码，把正文转为加密内容。若旧版本已公开，Git 历史中的明文仍需另行处理。"}</p><input id="protection-password" type="password" autocomplete="new-password" placeholder="${p.protected ? '当前密码' : '至少 8 个字符'}"><button class="btn" id="toggle-protection" type="button">${p.protected ? "解除保护" : "设置密码并加密"}</button>`
         : '<p class="muted">加密功能维护中。已存在的密文、私有原文和密码记录均不会被修改；修复完成前不可加密或解除保护。</p>';
