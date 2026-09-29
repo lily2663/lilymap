@@ -24,6 +24,7 @@ import { createResourceService } from './src/services/resource-service.mjs';
 import { safeSlug } from './src/domain/slug.mjs';
 import YAML from 'yaml';
 import { parseFrontMatter, patchFrontMatter } from './src/domain/front-matter.mjs';
+import { parseToml } from './src/domain/toml.mjs';
 import { decryptProtectedBody, encryptProtectedBody } from './src/domain/protected-content.mjs';
 import { isObject, parseYaml } from './src/domain/value.mjs';
 import { createHttpPrimitives } from './src/http/primitives.mjs';
@@ -241,6 +242,16 @@ async function blogStatus() {
   const running = previewState.status === 'running';
   const ready = running && await exists(path.join(hugoPublicRoot, 'index.html'));
   return { ...previewSnapshot(), running, ready };
+}
+
+async function protectionFeatureEnabled() {
+  try {
+    const raw = await fs.readFile(path.join(repoRoot, 'hugo.toml'), 'utf8');
+    return parseToml(raw).values['params.protected.enabled'] !== false;
+  } catch {
+    // 配置读取失败时沿用旧版本行为，避免因临时配置错误误锁住恢复入口。
+    return true;
+  }
 }
 
 async function articleRecord(file, changes) {
@@ -478,6 +489,22 @@ async function handleApi(req, res, url) {
   if (await publishRoutes(req, res, url)) return;
   if (await layoutModuleRoutes(req, res, url)) return;
   if (await resourceRoutes(req, res, url)) return;
+  if (req.method === 'GET' && pathname === '/api/status') {
+    const [changes, branch, head, blog, mediaTools] = await Promise.all([gitChanges(), git(['branch', '--show-current']), git(['log', '-1', '--format=%h%x00%s%x00%aI']), blogStatus(), mediaToolsStatus()]);
+    const postCount = (await listPosts(changes)).filter((post) => post.path.startsWith('content/posts/')).length;
+    return send(res, 200, {
+      apiVersion: 6,
+      repoRoot,
+      paths: { repository: repoRoot, content: contentRoot, static: staticRoot, siteAssets: siteAssetsRoot, public: hugoPublicRoot, publicAssetPrefix: '/assets/' },
+      theme: { name: themeName, root: themeRoot, compatible: await exists(path.join(themeRoot, 'theme-config.schema.json')) },
+      hugo: { executable: hugoExecutable, source: hugoSource, bundled: await exists(bundledHugoExecutable) },
+      mediaTools,
+      branch: branch.stdout.trim(), changes, postCount, blogUrl: blog.url, blogLanUrl: blog.lanUrl,
+      blogRunning: blog.running, blogStatus: blog.status, preview: blog, build: buildSnapshot(),
+      head: head.stdout.trim().split('\0'),
+      protectionFeatureEnabled: await protectionFeatureEnabled(),
+    });
+  }
   if (req.method === 'GET' && pathname === '/api/posts') return send(res, 200, { posts: await listPosts() });
   if (req.method === 'GET' && pathname === '/api/admin/export') {
     const archive = await createLilyMapSourceArchive({ repoRoot, adminDir });
@@ -525,6 +552,7 @@ async function handleApi(req, res, url) {
     return send(res, 200, { ok: true, version: versionFor(saved, savedStat), article: await articleRecord(target, await gitChanges()) });
   }
   if (req.method === 'POST' && pathname === '/api/protected') {
+    if (!(await protectionFeatureEnabled())) return fail(res, 503, '文章加密功能正在维护中，暂不接受加密或解除保护操作。');
     const request = JSON.parse((await readBody(req, 16 * 1024)).toString('utf8'));
     const target = repoPath(request.path, [path.join(contentRoot, 'posts')]);
     if (!target || path.basename(target).toLowerCase() !== 'index.md' || !(await exists(target))) return fail(res, 404, '文章不存在。');

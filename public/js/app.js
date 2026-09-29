@@ -301,8 +301,13 @@ async function openArticle(path) {
       x.classList.toggle("on", x.dataset.tab === tab),
     );
     let b = $("#drawer-body");
-    if (tab === "meta")
-      b.innerHTML = `<div class="form"><label class="field full"><span>标题</span><input id="f-title" value="${esc(p.title)}"></label><label class="field"><span>日期</span><input id="f-date" type="date" value="${esc(String(p.date).slice(0, 10))}"></label><label class="field"><span>Slug</span><input id="f-slug" value="${esc(p.slug)}"></label><label class="field full"><span>标签（逗号分隔）</span><input id="f-tags" value="${esc((p.tags || []).join(", "))}"></label><label class="field full"><span>摘要 / Description</span><input id="f-summary" value="${esc(p.summary || p.description || "")}"></label><label class="field full"><span>Cover</span><input id="f-cover" value="${esc(p.cover || "")}"></label><label class="switch"><span><b>草稿</b><p>暂不发布到生产构建</p></span><input id="f-draft" type="checkbox" ${p.draft ? "checked" : ""}></label><div class="field"><span>受保护文章</span><p class="muted">${p.protected ? "已加密；解除保护将使正文公开。" : "可设置密码，把正文转为加密内容。若旧版本已公开，Git 历史中的明文仍需另行处理。"}</p><input id="protection-password" type="password" autocomplete="new-password" placeholder="${p.protected ? '当前密码' : '至少 8 个字符'}"><button class="btn" id="toggle-protection" type="button">${p.protected ? "解除保护" : "设置密码并加密"}</button></div></div><p><button class="btn primary" id="save-meta">保存属性</button></p>`;
+    if (tab === "meta") {
+      const protectionEnabled = state.status?.protectionFeatureEnabled !== false;
+      const protectionControls = protectionEnabled
+        ? `<p class="muted">${p.protected ? "已加密；解除保护将使正文公开。" : "可设置密码，把正文转为加密内容。若旧版本已公开，Git 历史中的明文仍需另行处理。"}</p><input id="protection-password" type="password" autocomplete="new-password" placeholder="${p.protected ? '当前密码' : '至少 8 个字符'}"><button class="btn" id="toggle-protection" type="button">${p.protected ? "解除保护" : "设置密码并加密"}</button>`
+        : '<p class="muted">加密功能维护中。已存在的密文、私有原文和密码记录均不会被修改；修复完成前不可加密或解除保护。</p>';
+      b.innerHTML = `<div class="form"><label class="field full"><span>标题</span><input id="f-title" value="${esc(p.title)}"></label><label class="field"><span>日期</span><input id="f-date" type="date" value="${esc(String(p.date).slice(0, 10))}"></label><label class="field"><span>Slug</span><input id="f-slug" value="${esc(p.slug)}"></label><label class="field full"><span>标签（逗号分隔）</span><input id="f-tags" value="${esc((p.tags || []).join(", "))}"></label><label class="field full"><span>摘要 / Description</span><input id="f-summary" value="${esc(p.summary || p.description || "")}"></label><label class="field full"><span>Cover</span><input id="f-cover" value="${esc(p.cover || "")}"></label><label class="switch"><span><b>草稿</b><p>暂不发布到生产构建</p></span><input id="f-draft" type="checkbox" ${p.draft ? "checked" : ""}></label><div class="field"><span>受保护文章</span>${protectionControls}</div></div><p><button class="btn primary" id="save-meta">保存属性</button></p>`;
+    }
     else if (tab === "assets") {
       b.innerHTML = `<h2>文章资源</h2><p class="muted">图片上传与引用属于 Page Bundle；不会改写正文。</p><div class="asset-group"><b>${p.kind === "bundle" ? "可上传图片到此 Bundle" : "现有单 Markdown 文件；请在 Typora 或 Explorer 中整理资源。"}</b><span class="path">${esc(p.directory)}</span></div>${p.kind === "bundle" ? '<div class="asset-grid" id="bundle-imgs"></div><input id="asset-upload" type="file" accept="image/*"><pre id="asset-ref" class="path"></pre>' : ""}`;
       async function loadBundleImgs() {
@@ -394,7 +399,7 @@ async function openArticle(path) {
           toast(e.message);
         }
       };
-    if (tab === 'meta') $('#toggle-protection').onclick = async () => {
+    if (tab === 'meta' && $('#toggle-protection')) $('#toggle-protection').onclick = async () => {
       const password = $('#protection-password').value;
       if (password.length < 8) return toast('密码至少需要 8 个字符。');
       if (p.protected && !confirm('解除保护后正文会公开显示；确定继续？')) return;
