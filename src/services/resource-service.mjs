@@ -25,6 +25,35 @@ export function createResourceService({
   };
   const inside = (root, candidate) => resolveInside(root, candidate);
   const relativeToRepo = (target) => path.relative(repoRoot, target).split(path.sep).join('/');
+  const generatedRoot = path.join(staticRoot, 'assets', 'img', 'responsive');
+  const contained = (root, target) => {
+    const relative = path.relative(root, target);
+    return relative === '' || (relative !== '..' && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative));
+  };
+  async function canonicalWithMissing(target) {
+    let current = path.resolve(target);
+    const missing = [];
+    while (true) {
+      try { return path.resolve(await fsApi.realpath(current), ...missing); }
+      catch (error) {
+        if (!['ENOENT', 'ENOTDIR'].includes(error.code)) return null;
+        const parent = path.dirname(current);
+        if (parent === current) return null;
+        missing.unshift(path.basename(current));
+        current = parent;
+      }
+    }
+  }
+  const isGeneratedResource = async (target) => {
+    if (contained(generatedRoot, target)) return true;
+    // Internal junctions can reach the same files through a different spelling.
+    // Resolve existing ancestors too, so an upload into an absent subdirectory
+    // beneath such an alias cannot enter the generated image store.
+    const [canonicalRoot, canonicalTarget] = await Promise.all([
+      canonicalWithMissing(generatedRoot), canonicalWithMissing(target),
+    ]);
+    return Boolean(canonicalRoot && canonicalTarget && contained(canonicalRoot, canonicalTarget));
+  };
 
   function publicPathForRepoFile(target) {
     const resolved = path.resolve(target);
@@ -45,9 +74,10 @@ export function createResourceService({
     return inside(staticRoot, parts.join(path.sep));
   }
 
-  function managedResourcePath(relative) {
+  async function managedResourcePath(relative) {
     if (!relative || path.isAbsolute(relative)) return null;
     const target = path.resolve(repoRoot, relative);
+    if (await isGeneratedResource(target)) return null;
     const allowedRoots = [siteAssetsRoot, path.join(contentRoot, 'posts')];
     if (!allowedRoots.some((root) => inside(root, path.relative(root, target)))) return null;
     if (!['image', 'video'].includes(mediaKind(target))) return null;
@@ -92,6 +122,7 @@ export function createResourceService({
         size: stat.size,
         modifiedAt: stat.mtime.toISOString(),
         extension: path.extname(file).slice(1).toLowerCase(),
+        generated: await isGeneratedResource(file),
       };
     }));
     return entries.sort((a, b) => a.path.localeCompare(b.path));
@@ -105,6 +136,9 @@ export function createResourceService({
     const dirInRepo = canonicalAssetDirectory(area);
     if (!dirInRepo) {
       throw Object.assign(new Error('站点资源统一写入 static/assets，请选择该目录下的安全子目录。'), { statusCode: 400 });
+    }
+    if (await isGeneratedResource(dirInRepo)) {
+      throw Object.assign(new Error('响应式图片目录由优化工具维护，请上传到原图目录。'), { statusCode: 400 });
     }
     if (!hasExpectedImageSignature(bytes, path.extname(safeName))) {
       throw Object.assign(new Error('图片内容与扩展名不匹配或文件已损坏。'), { statusCode: 400 });
@@ -121,7 +155,7 @@ export function createResourceService({
   }
 
   async function mutateFile({ method, relativePath, name, bytes }) {
-    const target = managedResourcePath(relativePath);
+    const target = await managedResourcePath(relativePath);
     if (!target || !(await exists(target)) || !(await fsApi.stat(target)).isFile()) {
       throw Object.assign(new Error('可管理的图片或视频不存在。'), { statusCode: 404 });
     }

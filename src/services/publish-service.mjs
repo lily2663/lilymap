@@ -118,17 +118,10 @@ export function createPublishService({
     const trackedSensitive = trackedLocal.stdout.split(/\r?\n/).filter(Boolean).filter(isSensitivePublishPath);
     if (trackedSensitive.length) throw new Error(`检测到不应进入 Git 的本机文件：${trackedSensitive.slice(0, 5).join(', ')}。请先从 Git 索引移除后再发布。`);
 
-    const add = await git([
-      'add', '-A', '--', '.',
-      ':(exclude).token',
-      ':(exclude).lilymap-local.json',
-      ':(exclude)lilymap.json',
-      ':(exclude)hugo-desk.json',
-      ':(exclude).secrets/**',
-      ':(exclude)private-content/**',
-      ':(exclude).admin-trash/**',
-      ':(exclude).backups/**',
-    ]);
+    // The repository's .gitignore already excludes local secrets and runtime
+    // data. Explicit exclude pathspecs here make Git report ignored paths as
+    // an error on Windows, causing an otherwise valid publish to stop at 20%.
+    const add = await git(['add', '-A', '--', '.']);
     if (add.code !== 0) throw new Error(`git add 失败：${add.stderr.trim()}`);
 
     const stagedNames = await git(['diff', '--cached', '--name-only', '--']);

@@ -21,6 +21,7 @@ import { createNetworkAdapter } from './src/services/network-adapter.mjs';
 import { createNeteaseService } from './src/services/netease-service.mjs';
 import { createLayoutModuleService } from './src/services/layout-module-service.mjs';
 import { createResourceService } from './src/services/resource-service.mjs';
+import { createImageOptimizationService } from './src/services/image-optimization-service.mjs';
 import { safeSlug } from './src/domain/slug.mjs';
 import YAML from 'yaml';
 import { parseFrontMatter, patchFrontMatter } from './src/domain/front-matter.mjs';
@@ -36,6 +37,7 @@ import { createNeteaseRoutes } from './src/http/routes/netease-routes.mjs';
 import { createPublishRoutes } from './src/http/routes/publish-routes.mjs';
 import { createLayoutModuleRoutes } from './src/http/routes/layout-module-routes.mjs';
 import { createResourceRoutes } from './src/http/routes/resource-routes.mjs';
+import { createImageOptimizationRoutes } from './src/http/routes/image-optimization-routes.mjs';
 
 // esbuild 打包成 cjs 后 __dirname 可用；dev 模式（node 直接跑 ESM）下 __dirname 不存在，
 // 用 import.meta.url 兜底推导。
@@ -476,6 +478,8 @@ const resourceRoutes = createResourceRoutes({
   resourceService,
   maxMediaBodyBytes,
 });
+const imageOptimization = createImageOptimizationService({ repoRoot, scheduleBuild });
+const imageOptimizationRoutes = createImageOptimizationRoutes({ readBody, send, fail, imageOptimization });
 
 async function handleApi(req, res, url) {
   const pathname = url.pathname;
@@ -489,11 +493,12 @@ async function handleApi(req, res, url) {
   if (await publishRoutes(req, res, url)) return;
   if (await layoutModuleRoutes(req, res, url)) return;
   if (await resourceRoutes(req, res, url)) return;
+  if (await imageOptimizationRoutes(req, res, url)) return;
   if (req.method === 'GET' && pathname === '/api/status') {
     const [changes, branch, head, blog, mediaTools] = await Promise.all([gitChanges(), git(['branch', '--show-current']), git(['log', '-1', '--format=%h%x00%s%x00%aI']), blogStatus(), mediaToolsStatus()]);
     const postCount = (await listPosts(changes)).filter((post) => post.path.startsWith('content/posts/')).length;
     return send(res, 200, {
-      apiVersion: 6,
+      apiVersion: 7,
       repoRoot,
       paths: { repository: repoRoot, content: contentRoot, static: staticRoot, siteAssets: siteAssetsRoot, public: hugoPublicRoot, publicAssetPrefix: '/assets/' },
       theme: { name: themeName, root: themeRoot, compatible: await exists(path.join(themeRoot, 'theme-config.schema.json')) },
@@ -560,7 +565,9 @@ async function handleApi(req, res, url) {
     const stat = await fs.stat(target);
     if (request.version !== versionFor(raw, stat)) return fail(res, 409, '文章已被修改，请重新打开后再操作。');
     const password = typeof request.password === 'string' ? request.password : '';
-    if (password.length < 8 || password.length > 256) return fail(res, 400, '密码长度须为 8 到 256 个字符。');
+    if (!password || password.length > 256 || (request.action === 'encrypt' && password.length < 8)) {
+      return fail(res, 400, request.action === 'encrypt' ? '新密码长度须为 8 到 256 个字符。' : '请输入有效密码。');
+    }
     const parsed = parseFrontMatter(raw);
     if (!parsed.rawFrontMatter) return fail(res, 400, '文章缺少 Front Matter。');
     const id = String(parsed.frontMatter.params?.commentId || path.basename(path.dirname(target)));

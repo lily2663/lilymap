@@ -66,6 +66,7 @@ function page(title, sub, actions = "") {
   if (state.view === 'drawers' && state.status && Number(state.status.apiVersion || 0) < 3) runtimeAlert = `<div class="runtime-alert" role="alert"><span>!</span><div><b>分类功能需要新版 LilyMap 后端</b><small>请关闭旧 LilyMap 进程，重新运行 npm run admin 后刷新页面。</small></div></div>`;
   if (state.view === 'friends' && state.status && Number(state.status.apiVersion || 0) < 4) runtimeAlert = `<div class="runtime-alert" role="alert"><span>!</span><div><b>友链管理需要新版 LilyMap 后端</b><small>请关闭旧 LilyMap 进程，重新运行 npm run admin 后刷新页面。</small></div></div>`;
   if (state.view === 'profile' && state.status && Number(state.status.apiVersion || 0) < 5) runtimeAlert = `<div class="runtime-alert" role="alert"><span>!</span><div><b>个人资料管理需要新版 LilyMap 后端</b><small>请重启 LilyMap 后端并刷新页面。</small></div></div>`;
+  if (state.view === 'resources' && state.status && Number(state.status.apiVersion || 0) < 7) runtimeAlert = `<div class="runtime-alert" role="alert"><span>!</span><div><b>图片优化需要新版 LilyMap 后端</b><small>请关闭旧 LilyMap 进程，重新启动后刷新页面。</small></div></div>`;
   return `<header class="top"><div><span class="top-kicker">LilyMap Workspace</span><h1>${title}</h1><p>${sub}</p></div><div class="actions">${actions}<button class="btn icon" id="theme" type="button" title="切换明暗" aria-label="切换明暗主题">◐</button></div></header>${runtimeAlert}`;
 }
 function bindCommon() {
@@ -304,7 +305,7 @@ async function openArticle(path) {
     if (tab === "meta") {
       const protectionEnabled = state.status?.protectionManagementEnabled !== false;
       const protectionControls = protectionEnabled
-        ? `<p class="muted">${p.protected ? "已加密；解除保护将使正文公开。" : "可设置密码，把正文转为加密内容。若旧版本已公开，Git 历史中的明文仍需另行处理。"}</p><input id="protection-password" type="password" autocomplete="new-password" placeholder="${p.protected ? '当前密码' : '至少 8 个字符'}"><button class="btn" id="toggle-protection" type="button">${p.protected ? "解除保护" : "设置密码并加密"}</button>`
+        ? `<p class="muted">${p.protected ? "已加密；解除保护将使正文公开。" : "可设置密码，把正文转为加密内容。若旧版本已公开，Git 历史中的明文仍需另行处理。"}</p><input id="protection-password" type="password" autocomplete="new-password" placeholder="${p.protected ? '输入当前密码' : '至少 8 个字符'}"><button class="btn" id="toggle-protection" type="button">${p.protected ? "解除保护" : "设置密码并加密"}</button>`
         : '<p class="muted">加密功能维护中。已存在的密文、私有原文和密码记录均不会被修改；修复完成前不可加密或解除保护。</p>';
       b.innerHTML = `<div class="form"><label class="field full"><span>标题</span><input id="f-title" value="${esc(p.title)}"></label><label class="field"><span>日期</span><input id="f-date" type="date" value="${esc(String(p.date).slice(0, 10))}"></label><label class="field"><span>Slug</span><input id="f-slug" value="${esc(p.slug)}"></label><label class="field full"><span>标签（逗号分隔）</span><input id="f-tags" value="${esc((p.tags || []).join(", "))}"></label><label class="field full"><span>摘要 / Description</span><input id="f-summary" value="${esc(p.summary || p.description || "")}"></label><label class="field full"><span>Cover</span><input id="f-cover" value="${esc(p.cover || "")}"></label><label class="switch"><span><b>草稿</b><p>暂不发布到生产构建</p></span><input id="f-draft" type="checkbox" ${p.draft ? "checked" : ""}></label><div class="field"><span>受保护文章</span>${protectionControls}</div></div><p><button class="btn primary" id="save-meta">保存属性</button></p>`;
     }
@@ -401,11 +402,11 @@ async function openArticle(path) {
       };
     if (tab === 'meta' && $('#toggle-protection')) $('#toggle-protection').onclick = async () => {
       const password = $('#protection-password').value;
-      if (password.length < 8) return toast('密码至少需要 8 个字符。');
+      const action = p.protected ? 'decrypt' : 'encrypt';
+      if (!password || password.length > 256 || (action === 'encrypt' && password.length < 8)) return toast(action === 'encrypt' ? '新密码至少需要 8 个字符。' : '请输入有效的当前密码。');
       if (p.protected && !confirm('解除保护后正文会公开显示；确定继续？')) return;
       if (!p.protected && !confirm('加密后原文章的历史版本仍可能含有明文；确定继续？')) return;
       try {
-        const action = p.protected ? 'decrypt' : 'encrypt';
         const result = await api('/api/protected', { method: 'POST', body: JSON.stringify({ path: p.path, version: d.version, password, action }), progressLabel: action === 'encrypt' ? '正在加密文章' : '正在解除文章保护' });
         const latest = await api('/api/post?path=' + encodeURIComponent(p.path));
         d = latest; p = latest.article;

@@ -3,6 +3,8 @@ import { $, esc, toast } from '../core/dom.js';
 import { state } from '../core/state.js';
 import { selectOptionIndex, selectOptionLabel, selectOptionValue } from '../core/value.js';
 
+let settingsRevision = 0;
+
 function settingField(field, currentValue) {
   const value = currentValue ?? field.default ?? '';
   const help = field.help || field.path;
@@ -31,7 +33,9 @@ function bindMenuDeletes() {
 }
 
 export async function renderSettings({ page, bindCommon, refresh }) {
+  const revision = ++settingsRevision;
   const data = await api('/api/settings');
+  if (revision !== settingsRevision || state.view !== 'settings') return;
   state.settings = data;
   const fields = data.schema.sections.map((section, index) =>
     `<details ${index < 2 || section.id === 'mobileLayout' ? 'open' : ''}><summary>${esc(section.label)}</summary><div class="settings-grid">${section.fields.map((field) => settingField(field, data.values[field.path])).join('')}</div></details>`

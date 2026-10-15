@@ -132,6 +132,12 @@ body {
   box-shadow: 0 10px 28px #10201d24;
 }
 .operation-progress[hidden] { display: none; }
+.resource-filters { margin-top: 18px; gap: 10px; }
+.resource-filters input { min-width: 0; flex: 1; }
+.resource-filters select { max-width: 100%; padding: 9px 12px; color: var(--ink); background: var(--panel); border: 1px solid var(--line); border-radius: var(--r-sm); }
+.resource-warning { color: var(--ink); font-weight: 600; }
+.optimization-log { white-space: pre-wrap; overflow-wrap: anywhere; max-height: 260px; overflow: auto; }
+#resource-more[hidden] { display: none; }
 .operation-progress__head { display: flex; justify-content: space-between; gap: 12px; font-size: 12px; }
 .operation-progress__head small { color: var(--muted); white-space: nowrap; }
 .operation-progress__track { height: 4px; margin-top: 9px; overflow: hidden; background: var(--accent-soft); }

@@ -103,3 +103,62 @@ test('resource listing exposes public paths only for static files', async (t) =>
   assert.equal(byPath['content/posts/hello/shot.png'].publicPath, null);
   assert.equal(byPath['assets/source.png'].scope, 'pipeline');
 });
+
+test('generated responsive images are listed as generated and cannot be edited or uploaded', async (t) => {
+  const { staticRoot, service, builds } = fixture(t);
+  const relativePath = 'static/assets/img/responsive/photo-480.png';
+  const target = path.join(staticRoot, 'assets', 'img', 'responsive', 'photo-480.png');
+  await fsp.mkdir(path.dirname(target), { recursive: true });
+  await fsp.writeFile(target, 'generated');
+  const files = await service.listFiles();
+  assert.equal(files.find((file) => file.path === relativePath).generated, true);
+  for (const method of ['PUT', 'PATCH', 'DELETE']) {
+    await assert.rejects(service.mutateFile({ method, relativePath, name: 'other.png', bytes: Buffer.from('changed') }), (error) => error.statusCode === 404);
+  }
+  await assert.rejects(service.uploadAsset({ name: 'other.png', area: 'static/assets/img/responsive', bytes: Buffer.from('new') }), (error) => error.statusCode === 400);
+  assert.equal(await fsp.readFile(target, 'utf8'), 'generated');
+  assert.equal(builds(), 0);
+});
+
+test('generated images remain protected through internal directory junction aliases and absent upload subdirectories', async (t) => {
+  const { staticRoot, service, builds } = fixture(t);
+  const imageRoot = path.join(staticRoot, 'assets', 'img');
+  const generatedRoot = path.join(imageRoot, 'responsive');
+  const target = path.join(generatedRoot, 'photo.png');
+  await fsp.mkdir(generatedRoot, { recursive: true });
+  await fsp.writeFile(target, 'generated');
+  try { await fsp.symlink(generatedRoot, path.join(imageRoot, 'alias'), process.platform === 'win32' ? 'junction' : 'dir'); }
+  catch (error) {
+    if (['EPERM', 'EACCES'].includes(error.code)) { t.skip('Directory junctions or symlinks are unavailable on this host.'); return; }
+    throw error;
+  }
+  for (const method of ['PUT', 'PATCH', 'DELETE']) {
+    await assert.rejects(service.mutateFile({
+      method, relativePath: 'static/assets/img/alias/photo.png', name: 'other.png', bytes: Buffer.from('changed'),
+    }), (error) => error.statusCode === 404);
+  }
+  for (const area of ['static/assets/img/alias', 'static/assets/img/alias/new/subdirectory']) {
+    await assert.rejects(service.uploadAsset({ name: 'other.png', area, bytes: Buffer.from('new') }), (error) => error.statusCode === 400);
+  }
+  assert.equal(await fsp.readFile(target, 'utf8'), 'generated');
+  assert.equal(await fsp.access(path.join(generatedRoot, 'new')).then(() => true).catch(() => false), false);
+  const files = await service.listFiles();
+  assert.equal(files.find((file) => file.path === 'static/assets/img/responsive/photo.png').generated, true);
+  assert.equal(builds(), 0);
+});
+
+test('resource listings mark the actual generated store when responsive itself is an internal junction', async (t) => {
+  const { staticRoot, service } = fixture(t);
+  const imageRoot = path.join(staticRoot, 'assets', 'img');
+  const store = path.join(imageRoot, 'generated-store');
+  await fsp.mkdir(store, { recursive: true });
+  await fsp.writeFile(path.join(store, 'photo.png'), 'generated');
+  try { await fsp.symlink(store, path.join(imageRoot, 'responsive'), process.platform === 'win32' ? 'junction' : 'dir'); }
+  catch (error) {
+    if (['EPERM', 'EACCES'].includes(error.code)) { t.skip('Directory junctions or symlinks are unavailable on this host.'); return; }
+    throw error;
+  }
+  const files = await service.listFiles();
+  assert.equal(files.find((file) => file.path === 'static/assets/img/generated-store/photo.png').generated, true);
+  await assert.rejects(service.mutateFile({ method: 'DELETE', relativePath: 'static/assets/img/generated-store/photo.png' }), (error) => error.statusCode === 404);
+});

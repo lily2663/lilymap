@@ -2,6 +2,12 @@ import { api, beginOperation, endOperation, trackedFetch } from '../core/api.js'
 import { $, esc, toast } from '../core/dom.js';
 import { state } from '../core/state.js';
 
+let appearanceRevision = 0;
+
+function currentAppearance(appearance) {
+  return state.view === 'appearance' && state.appr === appearance;
+}
+
 function isVideoPath(value) {
   return /\.(mp4|webm)(?:[?#].*)?$/i.test(String(value || ''));
 }
@@ -14,7 +20,8 @@ function appearanceMediaMarkup(source) {
   return `<img src="${esc(source)}" alt="">`;
 }
 
-function setAppearanceMedia(target, source) {
+function setAppearanceMedia(target, source, appearance) {
+  if (!currentAppearance(appearance)) return;
   const key = target === 'welcome' ? 'curW' : target === 'night' ? 'curN' : 'curA';
   state.appr[key] = source;
   const preview = document.querySelector(`.appr-preview[data-target="${target}"]`);
@@ -38,6 +45,7 @@ function readableBytes(value) {
 }
 
 async function importMediaPath(target) {
+  const appearance = state.appr;
   const input = $('#media-local-path');
   const stateNode = $('#media-import-state');
   const sourcePath = input?.value.trim();
@@ -51,7 +59,7 @@ async function importMediaPath(target) {
       method: 'POST',
       body: JSON.stringify({ sourcePath, target }),
     });
-    setAppearanceMedia(target, result.path);
+    setAppearanceMedia(target, result.path, appearance);
     const saving = result.sourceSize > 0 ? Math.max(0, Math.round((1 - result.outputSize / result.sourceSize) * 100)) : 0;
     stateNode.textContent = `${result.kind === 'video' ? '视频已转为 1080p H.264 MP4' : '图片已复制'}：${readableBytes(result.sourceSize)} → ${readableBytes(result.outputSize)}${saving ? `（-${saving}%）` : ''}。点击“应用外观”写入配置。`;
     toast('媒体导入完成；点击“应用外观”生效。');
@@ -116,6 +124,7 @@ async function optimizeAppearanceImage(file, target) {
 }
 
 async function uploadAsset(event, target) {
+  const appearance = state.appr;
   const file = event.target.files[0];
   if (!file) return;
   const mediaOperation = beginOperation('正在准备媒体文件');
@@ -132,7 +141,7 @@ async function uploadAsset(event, target) {
       );
       const result = await response.json().catch(() => ({}));
       if (!response.ok) throw new Error(result.error || '视频上传失败。');
-      setAppearanceMedia(target, result.path);
+      setAppearanceMedia(target, result.path, appearance);
       const saving = result.sourceSize > 0 ? Math.max(0, Math.round((1 - result.outputSize / result.sourceSize) * 100)) : 0;
       toast(`视频已优化 ${readableBytes(result.sourceSize)} → ${readableBytes(result.outputSize)}${saving ? `（-${saving}%）` : ''}；点击“应用外观”生效。`);
       return;
@@ -150,7 +159,7 @@ async function uploadAsset(event, target) {
     );
     const result = await response.json();
     if (!response.ok) throw new Error(result.error || '上传失败。');
-    setAppearanceMedia(target, result.path);
+    setAppearanceMedia(target, result.path, appearance);
     const saving = prepared.before > 0 ? Math.max(0, Math.round((1 - prepared.after / prepared.before) * 100)) : 0;
     toast(prepared.optimized
       ? `已优化 ${readableBytes(prepared.before)} → ${readableBytes(prepared.after)}（-${saving}% · ${prepared.dimensions}）；点击「应用外观」生效。`
@@ -167,7 +176,9 @@ async function uploadAsset(event, target) {
 }
 
 export async function renderAppearance({ page, bindCommon }) {
+  const revision = ++appearanceRevision;
   const [settingsResponse, fileResponse] = await Promise.all([api('/api/settings'), api('/api/files')]);
+  if (revision !== appearanceRevision || state.view !== 'appearance') return;
   state.settings = settingsResponse;
   const files = fileResponse.files.filter((file) => file.publicPath && ['image', 'video'].includes(file.kind));
   const assets = files.map((file) => file.publicPath);
@@ -216,25 +227,35 @@ export async function renderAppearance({ page, bindCommon }) {
   });
 
   $('#appr-save').onclick = async () => {
+    const appearance = state.appr;
+    const button = $('#appr-save');
+    if (button.disabled) return;
+    button.disabled = true;
+    const values = {
+      'params.welcome.background': appearance.curW,
+      'params.welcome.backgroundDark': appearance.curN,
+      'params.avatar': appearance.curA,
+    };
     try {
       await api('/api/settings', {
         method: 'PATCH',
         body: JSON.stringify({
-          values: {
-            'params.welcome.background': state.appr.curW,
-            'params.welcome.backgroundDark': state.appr.curN,
-            'params.avatar': state.appr.curA,
-          },
+          values,
         }),
       });
-      state.appr.dirty = false;
-      $('#appr-save').textContent = '已应用';
+      if (!currentAppearance(appearance)) return;
+      appearance.dirty = appearance.curW !== values['params.welcome.background']
+        || appearance.curN !== values['params.welcome.backgroundDark']
+        || appearance.curA !== values['params.avatar'];
+      button.textContent = appearance.dirty ? '保存并应用 · 有修改' : '已应用';
       setTimeout(() => {
-        if ($('#appr-save')) $('#appr-save').textContent = '保存并应用';
+        if (currentAppearance(appearance) && !appearance.dirty) button.textContent = '保存并应用';
       }, 1200);
       toast('外观已应用，欢迎页与内页背景已更新。');
     } catch (error) {
       toast(error.message);
+    } finally {
+      button.disabled = false;
     }
   };
 }
