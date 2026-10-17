@@ -23,6 +23,8 @@ npm run release
 
 LilyMap 将 `lily-epitaph` 的兼容提交固定在 `.github/theme-compatibility.json`。每周检查上游新提交；发现变化时，先用完整验证工作流检查精确的新提交，通过后才开更新 pin 的 PR。这样上游主题不会悄悄漂移，也不会因旧 pin 永远冻结而漏掉新兼容性问题。
 
+本地验证一组 LilyMap 与主题修改时，设置 `LILY_TEST_THEME_PATH` 为主题 checkout 的绝对路径、`LILY_TEST_HUGO_PATH` 为 Hugo 可执行文件路径，然后运行 `npm test` 和 `npm run protocol:check`。测试会在临时博客中验证管理器保存的分页篇数、分页 SEO、favicon 和天气参数；未设置这两个变量时，主题渲染集成测试会跳过。CI 使用 pin 指定的主题提交和 Hugo 0.165.0 执行这些检查。
+
 Windows x64 打包会把 `public/favicon.ico` 中的团子图标和 LilyMap 产品信息写入 EXE。图标在打包载荷之前嵌入临时运行时副本，不修改共享 Node 缓存。升级时需把新 EXE 复制到自己实际启动的位置（例如桌面），并保留同目录的 `lilymap.json`。
 
 独立 LilyMap 仓库发布 Windows 便携包时使用 `npm run release`。它在 `dist/` 生成 `LilyMap.exe` 和 `lilymap.json.example`；把 EXE 放进博客根目录，或编辑示例中的 `repoRoot` 后再运行。
@@ -64,7 +66,7 @@ Windows x64 打包会把 `public/favicon.ico` 中的团子图标和 LilyMap 产�
 11. 从“外观”上传壁纸或头像时，默认在本机浏览器中生成高清 WebP，并显示压缩前后大小；质量档位和自动优化开关同样位于“手机工具与性能”。
 12. 在“个人资料”编辑作者名、简介和社交链接；作者名同时更新 `data/site.yaml` 和 `hugo.toml`。
 13. 在“资源”可替换、重命名或删除受管理的文件；重命名不会自动改写文章引用，删除会先移到 `.admin-trash/`。
-14. 在“布局 → 首页 → Recent Posts”设置文章置顶、排序和每页篇数；“博客设置”可调整深色配色与 favicon。
+14. 在“布局 → 首页 → Recent Posts”设置文章置顶、排序和每页篇数；分页标题、canonical 和分享地址会跟随实际页码。“博客设置”可调整深色配色与 favicon；图标路径留空时，主题会从支持的本地静态头像生成最长边 48px 的图标，远程头像或不支持的格式沿用原地址；显式填写的图标 URL 保持原样。
 15. 在“发布”可修改本机 GitHub 仓库目标；在“系统诊断”可导出 LilyMap 源码包，用于迁移到另一份博客仓库。
 16. 在“模块库 → 网易云音乐 → 歌曲筛选与音源检测”点击“一键检测并精简”，仅将明确不可用的公开音源从博客播放器排除；网络异常保持待确认，可随时恢复全部歌曲。播放器支持列表循环、单曲循环、随机播放。
 17. 跨页播放在页面角落以小音乐入口驻留，点击才展开；窄屏有侧栏时播放器进入团子工具面板，没有侧栏时才在团子上方显示小入口，避免常驻面板遮挡正文。
