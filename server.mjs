@@ -22,9 +22,13 @@ import { createNeteaseService } from './src/services/netease-service.mjs';
 import { createLayoutModuleService } from './src/services/layout-module-service.mjs';
 import { createResourceService } from './src/services/resource-service.mjs';
 import { createImageOptimizationService } from './src/services/image-optimization-service.mjs';
+import { createRuntimeInfoService } from './src/services/runtime-info.mjs';
+import { readEmbeddedBuildInfo } from './src/domain/build-provenance.mjs';
 import { safeSlug } from './src/domain/slug.mjs';
 import YAML from 'yaml';
 import { parseFrontMatter, patchFrontMatter } from './src/domain/front-matter.mjs';
+import { describeArticle, explicitDescription, explicitSummary, isProtectedFrontMatter } from './src/domain/article-description.mjs';
+import { EMPTY_SITE_SHARE_CONTEXT, explicitShareImage, resolveShareImage } from './src/domain/share-image.mjs';
 import { parseToml } from './src/domain/toml.mjs';
 import { decryptProtectedBody, encryptProtectedBody } from './src/domain/protected-content.mjs';
 import { isObject, parseYaml } from './src/domain/value.mjs';
@@ -256,7 +260,23 @@ async function protectionManagementEnabled() {
   }
 }
 
-async function articleRecord(file, changes) {
+// 站点级分享图上下文（C1-05）：属于站点配置，与单篇文章无关。
+// 列表与单篇接口都复用同一个已计算值，避免每篇文章重复读 hugo.toml。
+// 读取失败时返回空上下文，让解析结果降级为 none，而不是让接口整体报错。
+async function readSiteShareContext() {
+  try {
+    const raw = await fs.readFile(path.join(repoRoot, 'hugo.toml'), 'utf8');
+    const values = parseToml(raw).values;
+    return {
+      siteShare: values['params.shareImage'] || '',
+      avatar: values['params.avatar'] || '',
+    };
+  } catch {
+    return { ...EMPTY_SITE_SHARE_CONTEXT };
+  }
+}
+
+async function articleRecord(file, changes, siteShareContext = EMPTY_SITE_SHARE_CONTEXT) {
   const raw = await fs.readFile(file, 'utf8');
   const stat = await fs.stat(file);
   const { frontMatter, body } = parseFrontMatter(raw);
@@ -264,6 +284,20 @@ async function articleRecord(file, changes) {
   const bundle = path.basename(file).toLowerCase() === 'index.md';
   const params = frontMatter.params && typeof frontMatter.params === 'object' ? frontMatter.params : {};
   const change = changes.find((item) => item.path === relative || item.path.endsWith(`/${relative}`));
+  // 描述与 summary 必须分开表达：
+  //   description          = front matter 里**显式**的值（未设置 → 空），供编辑框回填；
+  //   effectiveDescription = 主题公开输出实际会用的文本（只读展示）；
+  //   descriptionSource    = 该文本来自哪一级回退，供 UI 说明"为什么这里显示的是这个值"。
+  // 旧实现用 description: frontMatter.description || frontMatter.summary || ''，
+  // 让前端无法区分“显式设置”和“回退值”，保存时把回退值写回文件。
+  const described = describeArticle({ frontMatter, body });
+  // 分享图同样必须分开表达（C1-05）：
+  //   shareImage          = front matter 里**显式**的值（未设置 → 空），供编辑框回填；
+  //   effectiveShareImage = 主题公开输出实际会用的图片（只读展示）；
+  //   shareImageSource    = 该图片来自哪一级回退（articleShare|cover|siteShare|avatar|none）。
+  // 解析顺序与 themes/lily-epitaph/layouts/partials/seo/share-image.html 逐字对齐，
+  // 受保护文章不采信文章级 shareImage/cover（只允许 siteShare/avatar）。
+  const share = resolveShareImage({ frontMatter, site: siteShareContext, section: 'posts' });
   return {
     path: relative,
     fileName: path.basename(file),
@@ -273,8 +307,14 @@ async function articleRecord(file, changes) {
     slug: frontMatter.slug || path.basename(bundle ? path.dirname(file) : file, path.extname(file)),
     date: frontMatter.date || '', lastmod: frontMatter.lastmod || '', draft: frontMatter.draft === true,
     tags: Array.isArray(frontMatter.tags) ? frontMatter.tags : [], categories: Array.isArray(frontMatter.categories) ? frontMatter.categories : [],
-    description: frontMatter.description || frontMatter.summary || '', summary: frontMatter.summary || '', cover: frontMatter.cover || frontMatter.image || '',
-    legacyId: params.legacyId || frontMatter.legacyId || '', protected: params.protected === true || frontMatter.protected === true,
+    description: explicitDescription(frontMatter), summary: explicitSummary(frontMatter),
+    effectiveDescription: described.effectiveDescription, descriptionSource: described.descriptionSource,
+    descriptionBudgeted: described.budgeted,
+    shareImage: explicitShareImage(frontMatter),
+    effectiveShareImage: share.effectiveShareImage,
+    shareImageSource: share.shareImageSource,
+    cover: frontMatter.cover || frontMatter.image || '',
+    legacyId: params.legacyId || frontMatter.legacyId || '', protected: isProtectedFrontMatter(frontMatter),
     wordCount: body.trim() ? body.trim().split(/\s+/).length : 0, size: stat.size, modifiedAt: stat.mtime.toISOString(),
     git: change?.status || '', version: versionFor(raw, stat), frontMatter,
   };
@@ -283,7 +323,9 @@ async function articleRecord(file, changes) {
 async function listPosts(changes = null) {
   const currentChanges = changes || await gitChanges();
   const files = await walk(contentRoot, (file) => /\.md$/i.test(file));
-  const posts = await Promise.all(files.map((file) => articleRecord(file, currentChanges)));
+  // 站点级分享图上下文只读一次，所有文章复用（避免每篇都读 hugo.toml）
+  const siteShareContext = await readSiteShareContext();
+  const posts = await Promise.all(files.map((file) => articleRecord(file, currentChanges, siteShareContext)));
   return posts.sort((a, b) => String(b.lastmod || b.date || b.modifiedAt).localeCompare(String(a.lastmod || a.date || a.modifiedAt)));
 }
 
@@ -344,6 +386,41 @@ const { stageFile, atomicWrite, atomicCreate, copyWithoutClobber } = createAtomi
   scheduleBuild,
   httpError,
   relativeToRepo,
+});
+
+// 运行来源诊断：只读当前进程与磁盘的事实，供 /api/status 的 runtime 字段使用。
+// 刻意复用 build-service 的 snapshot 与 git service，避免出现第二份“构建状态”。
+const runtimeInfo = createRuntimeInfoService({
+  repoRoot,
+  adminRoot: adminDir,
+  themeRoot,
+  themeName,
+  publicDir: hugoPublicRoot,
+  getPort: () => server.address()?.port || port,
+  readAppVersion() {
+    try {
+      return JSON.parse(fsSync.readFileSync(path.join(adminDir, 'package.json'), 'utf8')).version || 'unknown';
+    } catch {
+      return 'unknown';
+    }
+  },
+  readEmbeddedBuildInfo,
+  async readWorkspaceSource() {
+    // 工作区状态取自磁盘仓库本身。取不到就返回空对象，由 runtime-info 降级为 unknown。
+    const [head, branch, changes] = await Promise.all([
+      git(['rev-parse', 'HEAD']),
+      git(['rev-parse', '--abbrev-ref', 'HEAD']),
+      gitChanges(),
+    ]);
+    return {
+      head: head.code === 0 ? head.stdout.trim() : '',
+      branch: branch.code === 0 ? branch.stdout.trim() : '',
+      dirty: Array.isArray(changes) ? changes.length > 0 : undefined,
+    };
+  },
+  readBuildSnapshot: buildSnapshot,
+  packed: isPacked,
+  executablePath: isPacked ? process.execPath : '',
 });
 
 const importService = createImportService({
@@ -495,10 +572,10 @@ async function handleApi(req, res, url) {
   if (await resourceRoutes(req, res, url)) return;
   if (await imageOptimizationRoutes(req, res, url)) return;
   if (req.method === 'GET' && pathname === '/api/status') {
-    const [changes, branch, head, blog, mediaTools] = await Promise.all([gitChanges(), git(['branch', '--show-current']), git(['log', '-1', '--format=%h%x00%s%x00%aI']), blogStatus(), mediaToolsStatus()]);
+    const [changes, branch, head, blog, mediaTools, runtime] = await Promise.all([gitChanges(), git(['branch', '--show-current']), git(['log', '-1', '--format=%h%x00%s%x00%aI']), blogStatus(), mediaToolsStatus(), runtimeInfo.snapshot()]);
     const postCount = (await listPosts(changes)).filter((post) => post.path.startsWith('content/posts/')).length;
     return send(res, 200, {
-      apiVersion: 7,
+      apiVersion: 8,
       repoRoot,
       paths: { repository: repoRoot, content: contentRoot, static: staticRoot, siteAssets: siteAssetsRoot, public: hugoPublicRoot, publicAssetPrefix: '/assets/' },
       theme: { name: themeName, root: themeRoot, compatible: await exists(path.join(themeRoot, 'theme-config.schema.json')) },
@@ -508,6 +585,7 @@ async function handleApi(req, res, url) {
       blogRunning: blog.running, blogStatus: blog.status, preview: blog, build: buildSnapshot(),
       head: head.stdout.trim().split('\0'),
       protectionManagementEnabled: await protectionManagementEnabled(),
+      runtime,
     });
   }
   if (req.method === 'GET' && pathname === '/api/posts') return send(res, 200, { posts: await listPosts() });
@@ -530,7 +608,7 @@ async function handleApi(req, res, url) {
     const target = repoPath(url.searchParams.get('path'));
     if (!target || !(await exists(target)) || !/\.md$/i.test(target)) return fail(res, 404, '文章不存在。');
     const raw = await fs.readFile(target, 'utf8'); const stat = await fs.stat(target);
-    return send(res, 200, { raw, version: versionFor(raw, stat), article: await articleRecord(target, await gitChanges()) });
+    return send(res, 200, { raw, version: versionFor(raw, stat), article: await articleRecord(target, await gitChanges(), await readSiteShareContext()) });
   }
   if (req.method === 'PUT' && pathname === '/api/post') {
     const target = repoPath(url.searchParams.get('path'));
@@ -541,7 +619,7 @@ async function handleApi(req, res, url) {
     if (request.version && request.version !== versionFor(previous, stat)) return send(res, 409, { error: '文件已被 Typora 或其他程序修改，请先重新载入或比较。', currentVersion: versionFor(previous, stat) });
     await atomicWrite(target, request.raw.replace(/^\uFEFF/, ''));
     const savedRaw = await fs.readFile(target, 'utf8'); const savedStat = await fs.stat(target);
-    return send(res, 200, { ok: true, version: versionFor(savedRaw, savedStat), article: await articleRecord(target, await gitChanges()) });
+    return send(res, 200, { ok: true, version: versionFor(savedRaw, savedStat), article: await articleRecord(target, await gitChanges(), await readSiteShareContext()) });
   }
   if (req.method === 'PATCH' && pathname === '/api/article') {
     const target = repoPath(url.searchParams.get('path'));
@@ -550,11 +628,11 @@ async function handleApi(req, res, url) {
     const previous = await fs.readFile(target, 'utf8'); const stat = await fs.stat(target);
     if (request.version && request.version !== versionFor(previous, stat)) return send(res, 409, { error: '文件已被外部修改，请重新载入后再保存。' });
     if (Object.hasOwn(request.changes || {}, 'protected')) return fail(res, 400, '请使用加密文章操作；单独修改保护标记不会加密正文。');
-    const allowed = ['title', 'date', 'lastmod', 'slug', 'summary', 'description', 'cover', 'draft', 'tags', 'categories'];
+    const allowed = ['title', 'date', 'lastmod', 'slug', 'summary', 'description', 'cover', 'shareImage', 'draft', 'tags', 'categories'];
     const changes = Object.fromEntries(Object.entries(request.changes || {}).filter(([key]) => allowed.includes(key)));
     await atomicWrite(target, patchFrontMatter(previous, changes));
     const saved = await fs.readFile(target, 'utf8'); const savedStat = await fs.stat(target);
-    return send(res, 200, { ok: true, version: versionFor(saved, savedStat), article: await articleRecord(target, await gitChanges()) });
+    return send(res, 200, { ok: true, version: versionFor(saved, savedStat), article: await articleRecord(target, await gitChanges(), await readSiteShareContext()) });
   }
   if (req.method === 'POST' && pathname === '/api/protected') {
     if (!(await protectionManagementEnabled())) return fail(res, 503, '文章加密管理功能正在维护中，暂不接受加密或解除保护操作。');

@@ -1,4 +1,5 @@
 import { copyFile, mkdir, mkdtemp, readFile, rm, rmdir } from 'node:fs/promises';
+import { mkdirSync, writeFileSync, unlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -14,7 +15,33 @@ const require = createRequire(import.meta.url);
 const pkgRequire = createRequire(require.resolve('@yao-pkg/pkg'));
 const { need } = pkgRequire('@yao-pkg/pkg-fetch');
 const metadata = JSON.parse(await readFile(path.join(root, 'package.json'), 'utf8'));
-const temporary = await mkdtemp(path.join(tmpdir(), 'lilymap-exe-'));
+
+// 临时目录选择（本轮实测的环境限制）：
+//   本机 os.tmpdir() 指向 D:\ImageAI\cache\temp，rcedit 在该路径下
+//   调用 Windows 资源接口会失败：`Fatal error: Unable to commit changes`。
+//   改用仓库内临时目录后正常。
+//   优先级：LILY_TMPDIR → 仓库内 .cache/tmp → 系统 tmpdir（仅当前两个不可写时）。
+function pickWorkDir() {
+  const candidates = [
+    process.env.LILY_TMPDIR,
+    path.join(root, '..', '..', '.cache', 'tmp'),
+    tmpdir(),
+  ].filter(Boolean);
+  for (const dir of candidates) {
+    try {
+      mkdirSync(dir, { recursive: true });
+      const probe = path.join(dir, `.write-probe-${process.pid}`);
+      writeFileSync(probe, 'ok');
+      unlinkSync(probe);
+      return dir;
+    } catch {
+      // 试下一个
+    }
+  }
+  return tmpdir();
+}
+
+const temporary = await mkdtemp(path.join(pickWorkDir(), 'lilymap-exe-'));
 const brandedBase = path.join(temporary, 'node-lilymap.exe');
 
 try {

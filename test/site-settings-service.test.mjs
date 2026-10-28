@@ -100,7 +100,11 @@ test('profile update rejects stale versions before mutating files', async (t) =>
 
 test('settings patch preserves typed select values and synchronizes identity data', async (t) => {
   const { root, siteDataFile, service, builds } = await fixture(t);
+  const current = await service.readSettings();
   const result = await service.patchSettings({
+    baseVersion: current.versions.settings,
+    schemaVersion: current.versions.schema,
+    identityVersion: current.versions.identity,
     values: {
       'params.author': 'Lily',
       'params.avatar': '/new.png',
@@ -116,5 +120,6 @@ test('settings patch preserves typed select values and synchronizes identity dat
   assert.equal(site.author, 'Lily');
   assert.equal(site.avatar, '/new.png');
   assert.equal(result.values['params.mode'], 2);
+  assert.equal(result.changed, true);
   assert.equal(builds(), 1);
 });

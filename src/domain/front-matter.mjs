@@ -49,7 +49,12 @@ export function patchFrontMatter(raw, changes) {
   const match = raw.match(/^---\r?\n([\s\S]*?)\r?\n---(\r?\n?)([\s\S]*)$/);
   const body = match ? match[3] : raw;
   let lines = match ? match[1].split(/\r?\n/) : [];
-  for (const key of ['title', 'date', 'lastmod', 'slug', 'summary', 'description', 'cover', 'draft', 'tags', 'categories']) {
+  // 行级 patch 白名单：**只**替换命中行的值，不做整文件 YAML 重序列化。
+  // 重序列化会丢掉注释、折叠多行字符串、重排未知键，造成正文之外的噪声 diff。
+  // C1-05 新增 shareImage（顶层 front matter，主题 seo/share-image.html 读取）。
+  // 清空 shareImage 写成 `shareImage: ""`：主题用 Hugo 的 `with` 判空，
+  // 空字符串等同未设置，因此清空后能正确回退到下一级候选。
+  for (const key of ['title', 'date', 'lastmod', 'slug', 'summary', 'description', 'cover', 'shareImage', 'draft', 'tags', 'categories']) {
     if (Object.hasOwn(changes, key)) lines = patchYamlBlock(lines, key, changes[key]);
   }
   if (Object.hasOwn(changes, 'protected') || Object.hasOwn(changes, 'commentId')) {

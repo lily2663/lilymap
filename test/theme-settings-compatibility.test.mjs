@@ -49,11 +49,20 @@ test('LilyMap settings and module saves preserve theme pagination, icons and wea
       trashRoot: path.join(root, '.admin-trash'), maxBodyBytes: 1024 * 1024,
       fileTransaction, atomicWrite: atomic.atomicWrite, scheduleBuild,
     });
-    await settings.patchSettings({ values: {
+    const patch = async (values) => {
+      const current = await settings.readSettings();
+      return settings.patchSettings({
+        baseVersion: current.versions.settings,
+        schemaVersion: current.versions.schema,
+        identityVersion: current.versions.identity,
+        values,
+      });
+    };
+    await patch({
       'params.avatar': '/assets/avatar.png', 'params.favicon': '',
       'params.description': 'Fixture description', 'params.features.prefetch': false,
       'params.mobileHub.defaultModule': 'weather', 'params.mobileHub.rememberTab': true,
-    } });
+    });
     await modules.saveLayout({ name: 'home', parsed: {
       kind: 'home', slotOrder: ['hero', 'main', 'sidebar'], slots: { hero: [], main: [], sidebar: [] },
     } });
@@ -68,6 +77,7 @@ test('LilyMap settings and module saves preserve theme pagination, icons and wea
     const saved = await settings.readSettings();
     assert.equal(saved.values['params.customSetting'], 'preserve');
     assert.equal(saved.values['params.favicon'], '');
+    // 第一次保存（1）+ home 布局（1）+ 两个模块配置（2）= 4 次重建。
     assert.equal(scheduled, 4, 'each management action schedules a build once');
 
     const build = (destination) => {
@@ -100,7 +110,7 @@ test('LilyMap settings and module saves preserve theme pagination, icons and wea
     assert.equal(image.readUInt32BE(20), 48);
     assert.deepEqual(await readFile(path.join(root, 'static/assets/avatar.png')), avatar);
 
-    await settings.patchSettings({ values: { 'params.favicon': '/assets/custom.svg?v=2' } });
+    await patch({ 'params.favicon': '/assets/custom.svg?v=2' });
     const explicitOutput = path.join(root, 'explicit-icon');
     build(explicitOutput);
     const explicit = await readFile(path.join(explicitOutput, 'index.html'), 'utf8');

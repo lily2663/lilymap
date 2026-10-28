@@ -237,11 +237,17 @@ export async function renderAppearance({ page, bindCommon }) {
       'params.avatar': appearance.curA,
     };
     try {
-      await api('/api/settings', {
+      // 保存契约需要显式版本：缺版本会被服务器以 428 拒绝，避免并发覆盖。
+      const versions = settingsResponse.versions || {};
+      const body = {
+        baseVersion: versions.settings,
+        schemaVersion: versions.schema,
+        identityVersion: versions.identity,
+        values,
+      };
+      const result = await api('/api/settings', {
         method: 'PATCH',
-        body: JSON.stringify({
-          values,
-        }),
+        body: JSON.stringify(body),
       });
       if (!currentAppearance(appearance)) return;
       appearance.dirty = appearance.curW !== values['params.welcome.background']
@@ -251,7 +257,8 @@ export async function renderAppearance({ page, bindCommon }) {
       setTimeout(() => {
         if (currentAppearance(appearance) && !appearance.dirty) button.textContent = '保存并应用';
       }, 1200);
-      toast('外观已应用，欢迎页与内页背景已更新。');
+      toast(result.changed === false ? '没有需要写入的改动。' : '外观已应用，欢迎页与内页背景已更新。');
+      if (result.versions) settingsResponse.versions = result.versions;
     } catch (error) {
       toast(error.message);
     } finally {

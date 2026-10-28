@@ -1,9 +1,10 @@
-import { api, trackedFetch } from './core/api.js';
+import { api, ApiError, trackedFetch } from './core/api.js';
 import { $, esc, toast } from './core/dom.js';
 import { allowedViews, state } from './core/state.js';
 import { decorateNavigation } from './core/icons.js';
 import { studioOverview } from './core/studio.js';
 import { selectOptionIndex, selectOptionLabel, selectOptionValue } from './core/value.js';
+import { collectMetaChanges, descriptionFields, metaSnapshot, refreshDescriptionHint, refreshShareImageHint } from './features/article-meta.js';
 import { renderModules, leaveModuleEditor } from './features/module-library.js';
 import { renderPublish } from './features/publish.js';
 import { renderAppearance } from './features/appearance.js';
@@ -287,6 +288,7 @@ function renderProfile() {
 async function showImporter() {
   setView("import");
 }
+// 文章属性面板的字段基线与双描述渲染见 features/article-meta.js（可独立单测）。
 async function openArticle(path) {
   let d = await api("/api/post?path=" + encodeURIComponent(path)),
     p = d.article;
@@ -297,6 +299,28 @@ async function openArticle(path) {
   w.innerHTML = `<div class="drawer-head"><div><h2>${esc(p.title)}</h2><span class="path">${esc(p.path)}</span></div><div class="actions"><button class="btn" id="preview">预览</button><button class="btn" id="copy-path">复制路径</button><button class="btn danger" id="trash">删除</button><button class="btn" id="close">×</button></div></div><div class="tabs"><button class="on" data-tab="meta">博客属性</button><button data-tab="assets">图片</button><button data-tab="source">源码</button><button data-tab="diff">Diff</button></div><div id="drawer-body"></div>`;
   document.body.append(m, w);
   let tab = "meta";
+  // 打开面板时的不可变基线：与后端返回的**显式**字段值一一对应。
+  // 保存时只提交与它不同的键，未触碰的日期/slug/summary/description 不进 changes。
+  let metaBaseline = metaSnapshot(p);
+  // 回退文本只用于“解释为什么公开页面显示这句”，绝不写进输入框。
+  // 保存后要跟着最新 article 更新，否则清空描述后预览的还是旧值。
+  let metaFallbackText = String(p.effectiveDescription || '');
+  function refreshMetaHint() {
+    metaFallbackText = String(p.effectiveDescription || '');
+    refreshDescriptionHint(document.querySelector('#description-source-hint'), {
+      description: $("#f-description")?.value ?? '',
+      summary: $("#f-summary")?.value ?? '',
+      isProtected: p.protected === true,
+      fallbackText: metaFallbackText,
+    });
+    refreshShareImageHint(document.querySelector('#share-image-source-hint'), {
+      shareImage: $("#f-shareImage")?.value ?? '',
+      cover: $("#f-cover")?.value ?? '',
+      isProtected: p.protected === true,
+      savedSource: p.shareImageSource,
+      savedEffective: p.effectiveShareImage,
+    });
+  }
   function draw() {
     w.querySelectorAll(".tabs button").forEach((x) =>
       x.classList.toggle("on", x.dataset.tab === tab),
@@ -307,7 +331,7 @@ async function openArticle(path) {
       const protectionControls = protectionEnabled
         ? `<p class="muted">${p.protected ? "已加密；解除保护将使正文公开。" : "可设置密码，把正文转为加密内容。若旧版本已公开，Git 历史中的明文仍需另行处理。"}</p><input id="protection-password" type="password" autocomplete="new-password" placeholder="${p.protected ? '输入当前密码' : '至少 8 个字符'}"><button class="btn" id="toggle-protection" type="button">${p.protected ? "解除保护" : "设置密码并加密"}</button>`
         : '<p class="muted">加密功能维护中。已存在的密文、私有原文和密码记录均不会被修改；修复完成前不可加密或解除保护。</p>';
-      b.innerHTML = `<div class="form"><label class="field full"><span>标题</span><input id="f-title" value="${esc(p.title)}"></label><label class="field"><span>日期</span><input id="f-date" type="date" value="${esc(String(p.date).slice(0, 10))}"></label><label class="field"><span>Slug</span><input id="f-slug" value="${esc(p.slug)}"></label><label class="field full"><span>标签（逗号分隔）</span><input id="f-tags" value="${esc((p.tags || []).join(", "))}"></label><label class="field full"><span>摘要 / Description</span><input id="f-summary" value="${esc(p.summary || p.description || "")}"></label><label class="field full"><span>Cover</span><input id="f-cover" value="${esc(p.cover || "")}"></label><label class="switch"><span><b>草稿</b><p>暂不发布到生产构建</p></span><input id="f-draft" type="checkbox" ${p.draft ? "checked" : ""}></label><div class="field"><span>受保护文章</span>${protectionControls}</div></div><p><button class="btn primary" id="save-meta">保存属性</button></p>`;
+      b.innerHTML = `<div class="form"><label class="field full"><span>标题</span><input id="f-title" value="${esc(p.title)}"></label><label class="field"><span>日期</span><input id="f-date" type="date" value="${esc(String(p.date).slice(0, 10))}"></label><label class="field"><span>Slug</span><input id="f-slug" value="${esc(p.slug)}"></label><label class="field full"><span>标签（逗号分隔）</span><input id="f-tags" value="${esc((p.tags || []).join(", "))}"></label>${descriptionFields(p)}<label class="field full"><span>Cover</span><input id="f-cover" value="${esc(p.cover || "")}"></label><label class="switch"><span><b>草稿</b><p>暂不发布到生产构建</p></span><input id="f-draft" type="checkbox" ${p.draft ? "checked" : ""}></label><div class="field"><span>受保护文章</span>${protectionControls}</div></div><p><button class="btn primary" id="save-meta">保存属性</button></p>`;
     }
     else if (tab === "assets") {
       b.innerHTML = `<h2>文章资源</h2><p class="muted">图片上传与引用属于 Page Bundle；不会改写正文。</p><div class="asset-group"><b>${p.kind === "bundle" ? "可上传图片到此 Bundle" : "现有单 Markdown 文件；请在 Typora 或 Explorer 中整理资源。"}</b><span class="path">${esc(p.directory)}</span></div>${p.kind === "bundle" ? '<div class="asset-grid" id="bundle-imgs"></div><input id="asset-upload" type="file" accept="image/*"><pre id="asset-ref" class="path"></pre>' : ""}`;
@@ -370,21 +394,38 @@ async function openArticle(path) {
           (b.innerHTML = `<pre class="path">${esc(r.diff || "该文件暂无 diff。")}</pre>`),
       );
     }
+    if (tab === "meta") {
+      for (const id of ['f-description', 'f-summary']) {
+        const input = document.querySelector(`#${id}`);
+        if (input) input.addEventListener('input', refreshMetaHint);
+      }
+    }
     if (tab === "meta")
       $("#save-meta").onclick = async () => {
+        // 只提交用户真的改过的字段：逐字段与打开面板时的基线比较。
+        // 旧实现每次都提交全部 8 个字段，会把浏览器规范化过的日期、
+        // 被 fallback 出来的摘要等"没动过"的值写回文件。
+        const current = {
+          title: $("#f-title").value,
+          date: $("#f-date").value,
+          slug: $("#f-slug").value,
+          tags: $("#f-tags")
+            .value.split(/[,，]/)
+            .map((x) => x.trim())
+            .filter(Boolean),
+          description: $("#f-description") ? $("#f-description").value : undefined,
+          summary: $("#f-summary") ? $("#f-summary").value : undefined,
+          cover: $("#f-cover").value,
+          draft: $("#f-draft").checked,
+        };
+        let ch = collectMetaChanges(metaBaseline, current);
+        if (!Object.keys(ch).length) {
+          toast("没有检测到修改，未发送保存请求。");
+          return;
+        }
+        const button = $("#save-meta");
+        button.disabled = true;
         try {
-          let ch = {
-            title: $("#f-title").value,
-            date: $("#f-date").value,
-            slug: $("#f-slug").value,
-            tags: $("#f-tags")
-              .value.split(/[,，]/)
-              .map((x) => x.trim())
-              .filter(Boolean),
-            summary: $("#f-summary").value,
-            cover: $("#f-cover").value,
-            draft: $("#f-draft").checked,
-          };
           let r = await api(
             "/api/article?path=" + encodeURIComponent(p.path),
             {
@@ -394,10 +435,18 @@ async function openArticle(path) {
           );
           Object.assign(p, r.article);
           d.version = r.version;
+          // 只把本次已提交的键并入基线；不整块重绘，保存期间继续输入的内容保持未保存状态。
+          for (const key of Object.keys(ch)) metaBaseline[key] = ch[key];
+          refreshMetaHint();
           toast("已最小化更新 Front Matter。");
           await refresh();
+          button.disabled = false;
         } catch (e) {
-          toast(e.message);
+          // 409（文件被外部修改）：保留输入与草稿值，不清空、不自动覆盖。
+          button.disabled = false;
+          toast(e instanceof ApiError && e.isConflict
+            ? "文章已在别处被修改，本次没有写入任何文件；你刚才的输入仍保留，请重新载入后比较差异。"
+            : e.message);
         }
       };
     if (tab === 'meta' && $('#toggle-protection')) $('#toggle-protection').onclick = async () => {

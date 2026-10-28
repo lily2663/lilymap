@@ -23,8 +23,50 @@ function validUrl(value) {
   return value === '' || /^(?:https?:\/\/|\/|\.\/|\.\.\/)/i.test(value);
 }
 
+// RFC3339 = 完整日期 + 时间 + 强制时区偏移（Z 或 ±HH:MM）。
+// 用真实解析而不是只查正则：2026-13-45T99:99:99+08:00 能通过粗正则但不是有效时间，
+// 而主题的 feeds/effective-time.html 会把它排除并记诊断 —— 与其让用户以为生效，
+// 不如在保存前拒绝。
+const RFC3339 = /^(\d{4})-(\d{2})-(\d{2})[Tt](\d{2}):(\d{2}):(\d{2})(?:\.\d+)?(?:[Zz]|([+-])(\d{2}):(\d{2}))$/;
+
+export function isValidRfc3339(value) {
+  if (typeof value !== 'string') return false;
+  const match = RFC3339.exec(value);
+  if (!match) return false;
+  const [, year, month, day, hour, minute, second, , offsetHour, offsetMinute] = match;
+  const numbers = [year, month, day, hour, minute, second].map(Number);
+  const [y, mo, d, h, mi, s] = numbers;
+  if (mo < 1 || mo > 12 || d < 1 || d > 31 || h > 23 || mi > 59 || s > 60) return false;
+  // 用 Date 复核“2 月 30 日”这类越界日期：Date 会把它进位到下个月，因此必须回读比对。
+  const stamp = new Date(Date.UTC(y, mo - 1, d));
+  if (stamp.getUTCFullYear() !== y || stamp.getUTCMonth() !== mo - 1 || stamp.getUTCDate() !== d) return false;
+  if (offsetHour != null && (Number(offsetHour) > 23 || Number(offsetMinute) > 59)) return false;
+  return true;
+}
+
+// 字段级可选约束，全部由 schema 声明，LilyMap 不硬编码任何字段路径：
+//   pattern  —— 正则源字符串，必须整串匹配（用 ^...$ 语义，自动加锚点）。
+//   format   —— 目前支持 "rfc3339" 与 "url"。
+// 未声明时行为与旧版本一致（只按 type 校验），因此旧 schema 不会因缺字段而报错。
+function satisfiesDeclaration(field, value) {
+  if (typeof field.pattern === 'string' && field.pattern) {
+    let expression;
+    try {
+      expression = new RegExp(`^(?:${field.pattern})$`, 'u');
+    } catch {
+      // schema 写错了不该让保存变成 500：跳过该约束，由 type 校验兜底。
+      return true;
+    }
+    if (!expression.test(String(value))) return false;
+  }
+  if (field.format === 'rfc3339') return isValidRfc3339(value);
+  if (field.format === 'url') return validUrl(value);
+  return true;
+}
+
 function validateField(field, value) {
   const type = field.type || 'string';
+  if (!satisfiesDeclaration(field, value)) return false;
   if (type === 'boolean') return typeof value === 'boolean';
   if (type === 'number') {
     return typeof value === 'number' && Number.isFinite(value)
